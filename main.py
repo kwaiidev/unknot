@@ -38,6 +38,15 @@ class Pose2D:
     score: float
 
 
+@dataclass(frozen=True)
+class MatchDebug:
+    keyframe_ordinal: int
+    scan_index: int
+    pose: Pose2D
+    submap_points: list[tuple[float, float]]
+    current_points: list[tuple[float, float]]
+
+
 def iter_scan_summaries(lidar_path: Path) -> Iterable[ScanSummary]:
     with lidar_path.open("r", encoding="utf-8") as scan_file:
         for line_number, line in enumerate(scan_file, start=1):
@@ -910,7 +919,7 @@ def frange(start: float, stop: float, step: float) -> list[float]:
     return values
 
 
-def estimate_odometry(
+def run_odometry_estimation(
     lidar_path: Path,
     limit: int,
     stride: int,
@@ -925,7 +934,10 @@ def estimate_odometry(
     search_step_m: float,
     search_theta_deg: float,
     search_theta_step_deg: float,
-) -> list[Pose2D]:
+    debug_keyframe_ordinals: set[int] | None = None,
+) -> tuple[list[Pose2D], list[MatchDebug]]:
+    debug_keyframe_ordinals = debug_keyframe_ordinals or set()
+    debug_matches = []
     keyframe_indices, valid_counts = select_keyframes(
         lidar_path=lidar_path,
         stride=stride,
@@ -938,7 +950,7 @@ def estimate_odometry(
     ]
     scans = list(iter_local_scans(lidar_path, selected_indices))
     if not scans:
-        return []
+        return [], []
 
     local_scans = [
         thin_scan_points(
@@ -952,6 +964,16 @@ def estimate_odometry(
 
     poses = [Pose2D(scans[0].scan_index, 0.0, 0.0, 0.0, 1.0)]
     world_scans = [transform_xy_points(local_scans[0], poses[0])]
+    if 0 in debug_keyframe_ordinals:
+        debug_matches.append(
+            MatchDebug(
+                keyframe_ordinal=0,
+                scan_index=scans[0].scan_index,
+                pose=poses[0],
+                submap_points=[],
+                current_points=world_scans[0],
+            )
+        )
 
     xy_offsets = frange(-search_xy_m, search_xy_m, search_step_m)
     theta_offsets = [
@@ -978,6 +1000,11 @@ def estimate_odometry(
             theta_rad=previous_pose.theta_rad + delta_theta,
             score=0.0,
         )
+        submap_world_points = [
+            point
+            for world_points in world_scans[-submap_keyframes:]
+            for point in world_points
+        ]
         submap_cells = build_submap_cells(
             world_scans=world_scans,
             cell_size_m=cell_size_m,
@@ -1018,8 +1045,57 @@ def estimate_odometry(
                             score=score,
                         )
 
+        current_world_points = transform_xy_points(local_points, best_pose)
+        keyframe_ordinal = len(poses)
+        if keyframe_ordinal in debug_keyframe_ordinals:
+            debug_matches.append(
+                MatchDebug(
+                    keyframe_ordinal=keyframe_ordinal,
+                    scan_index=scan.scan_index,
+                    pose=best_pose,
+                    submap_points=submap_world_points,
+                    current_points=current_world_points,
+                )
+            )
+
         poses.append(best_pose)
-        world_scans.append(transform_xy_points(local_points, best_pose))
+        world_scans.append(current_world_points)
+
+    return poses, debug_matches
+
+
+def estimate_odometry(
+    lidar_path: Path,
+    limit: int,
+    stride: int,
+    min_valid_points: int,
+    max_points: int,
+    min_range_m: float,
+    max_range_m: float,
+    cell_size_m: float,
+    inflation_cells: int,
+    submap_keyframes: int,
+    search_xy_m: float,
+    search_step_m: float,
+    search_theta_deg: float,
+    search_theta_step_deg: float,
+) -> list[Pose2D]:
+    poses, _debug_matches = run_odometry_estimation(
+        lidar_path=lidar_path,
+        limit=limit,
+        stride=stride,
+        min_valid_points=min_valid_points,
+        max_points=max_points,
+        min_range_m=min_range_m,
+        max_range_m=max_range_m,
+        cell_size_m=cell_size_m,
+        inflation_cells=inflation_cells,
+        submap_keyframes=submap_keyframes,
+        search_xy_m=search_xy_m,
+        search_step_m=search_step_m,
+        search_theta_deg=search_theta_deg,
+        search_theta_step_deg=search_theta_step_deg,
+    )
 
     return poses
 
@@ -1137,6 +1213,123 @@ def write_odometry_preview(
     image.save(output_path)
 
 
+def write_match_debug_plot(
+    match: MatchDebug,
+    output_path: Path,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 7 PNGs") from exc
+
+    width = 1100
+    height = 900
+    left = 74
+    right = 230
+    top = 64
+    bottom = 72
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    axis_color = (64, 64, 64)
+    grid_color = (225, 225, 225)
+    submap_color = (156, 163, 175)
+    current_color = (109, 40, 217)
+    pose_color = (220, 38, 38)
+
+    all_points = match.submap_points + match.current_points
+    if all_points:
+        min_x = min(x_m for x_m, _y_m in all_points)
+        max_x = max(x_m for x_m, _y_m in all_points)
+        min_y = min(y_m for _x_m, y_m in all_points)
+        max_y = max(y_m for _x_m, y_m in all_points)
+    else:
+        min_x = match.pose.x_m - 1.0
+        max_x = match.pose.x_m + 1.0
+        min_y = match.pose.y_m - 1.0
+        max_y = match.pose.y_m + 1.0
+
+    span_x = max(max_x - min_x, 1.0)
+    span_y = max(max_y - min_y, 1.0)
+    padding = max(span_x, span_y) * 0.08
+    min_x -= padding
+    max_x += padding
+    min_y -= padding
+    max_y += padding
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    scale = min(plot_width / span_x, plot_height / span_y)
+
+    def project(x_m: float, y_m: float) -> tuple[float, float]:
+        x = left + (x_m - min_x) * scale
+        y = top + plot_height - (y_m - min_y) * scale
+        return x, y
+
+    for step in range(6):
+        x = left + round(plot_width * step / 5)
+        y = top + round(plot_height * step / 5)
+        draw.line([(x, top), (x, top + plot_height)], fill=grid_color)
+        draw.line([(left, y), (left + plot_width, y)], fill=grid_color)
+
+    draw.rectangle((left, top, left + plot_width, top + plot_height), outline=axis_color)
+    draw.text(
+        (left, 18),
+        (
+            f"Stage 7 match debug: keyframe {match.keyframe_ordinal:04d} "
+            f"(scan {match.scan_index:05d})"
+        ),
+        fill=axis_color,
+    )
+    draw.text(
+        (left, 40),
+        f"score {match.pose.score:.2f} | current scan transformed into local submap frame",
+        fill=axis_color,
+    )
+
+    for x_m, y_m in match.submap_points:
+        x, y = project(x_m, y_m)
+        draw.point((round(x), round(y)), fill=submap_color)
+
+    for x_m, y_m in match.current_points:
+        x, y = project(x_m, y_m)
+        draw.rectangle((x - 1, y - 1, x + 1, y + 1), fill=current_color)
+
+    pose_x, pose_y = project(match.pose.x_m, match.pose.y_m)
+    arrow_len = 26
+    arrow_x = pose_x + math.cos(match.pose.theta_rad) * arrow_len
+    arrow_y = pose_y - math.sin(match.pose.theta_rad) * arrow_len
+    draw.ellipse((pose_x - 5, pose_y - 5, pose_x + 5, pose_y + 5), fill=pose_color)
+    draw.line([(pose_x, pose_y), (arrow_x, arrow_y)], fill=pose_color, width=2)
+
+    legend_x = left + plot_width + 34
+    legend_y = top + 10
+    draw.rectangle((legend_x, legend_y, legend_x + 14, legend_y + 14), fill=submap_color)
+    draw.text((legend_x + 24, legend_y - 1), "local submap", fill=axis_color)
+    draw.rectangle(
+        (legend_x, legend_y + 32, legend_x + 14, legend_y + 46),
+        fill=current_color,
+    )
+    draw.text((legend_x + 24, legend_y + 31), "current scan", fill=axis_color)
+    draw.ellipse(
+        (legend_x, legend_y + 64, legend_x + 14, legend_y + 78),
+        fill=pose_color,
+    )
+    draw.text((legend_x + 24, legend_y + 63), "pose", fill=axis_color)
+    draw.text((legend_x, legend_y + 104), f"x {match.pose.x_m:.2f} m", fill=axis_color)
+    draw.text((legend_x, legend_y + 126), f"y {match.pose.y_m:.2f} m", fill=axis_color)
+    draw.text(
+        (legend_x, legend_y + 148),
+        f"theta {math.degrees(match.pose.theta_rad):.1f} deg",
+        fill=axis_color,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -1248,6 +1441,54 @@ def run_stage6(args: argparse.Namespace) -> None:
         )
         print(f"estimated {len(poses)} poses for first {limit} scans")
         print(f"wrote {output_path}")
+
+
+def run_stage7(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.max_points <= 0:
+        raise ValueError("--max-points must be greater than 0")
+    if args.search_step_m <= 0.0:
+        raise ValueError("--search-step-m must be greater than 0")
+    if args.search_theta_step_deg <= 0.0:
+        raise ValueError("--search-theta-step-deg must be greater than 0")
+
+    debug_keyframes = parse_ints(args.keyframes)
+    if not debug_keyframes:
+        raise ValueError("--keyframes must include at least one keyframe ordinal")
+
+    limit = args.limit or ((max(debug_keyframes) + 1) * args.stride + 1)
+    _poses, debug_matches = run_odometry_estimation(
+        lidar_path=args.lidar,
+        limit=limit,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+        max_points=args.max_points,
+        min_range_m=args.min_range_m,
+        max_range_m=args.max_range_m,
+        cell_size_m=args.cell_size_m,
+        inflation_cells=args.inflation_cells,
+        submap_keyframes=args.submap_keyframes,
+        search_xy_m=args.search_xy_m,
+        search_step_m=args.search_step_m,
+        search_theta_deg=args.search_theta_deg,
+        search_theta_step_deg=args.search_theta_step_deg,
+        debug_keyframe_ordinals=set(debug_keyframes),
+    )
+
+    found_ordinals = {match.keyframe_ordinal for match in debug_matches}
+    missing_ordinals = sorted(set(debug_keyframes) - found_ordinals)
+    if missing_ordinals:
+        raise ValueError(f"did not capture debug keyframes: {missing_ordinals}")
+
+    debug_dir = args.out_dir / "debug_match"
+    for match in sorted(debug_matches, key=lambda item: item.keyframe_ordinal):
+        output_path = debug_dir / f"keyframe_{match.keyframe_ordinal:04d}.png"
+        write_match_debug_plot(match, output_path)
+        print(
+            f"wrote {output_path} "
+            f"(scan {match.scan_index}, score {match.pose.score:.2f})"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1526,6 +1767,107 @@ def build_parser() -> argparse.ArgumentParser:
             help="heading search step in degrees",
         )
         command.set_defaults(func=run_stage6)
+
+    for command_name in ("stage7", "debug-match"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 7 submap match debug overlays",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--keyframes",
+            default="120,240",
+            help="comma-separated keyframe ordinals to debug",
+        )
+        command.add_argument(
+            "--limit",
+            type=int,
+            help="scan prefix limit; defaults to enough scans for requested keyframes",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="keyframe stride in scans",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--max-points",
+            type=int,
+            default=120,
+            help="maximum scan points used by the matcher",
+        )
+        command.add_argument(
+            "--min-range-m",
+            type=float,
+            default=0.7,
+            help="minimum point range used by the matcher",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum point range used by the matcher",
+        )
+        command.add_argument(
+            "--cell-size-m",
+            type=float,
+            default=0.25,
+            help="submap occupancy grid cell size in meters",
+        )
+        command.add_argument(
+            "--inflation-cells",
+            type=int,
+            default=1,
+            help="cell inflation radius for scan matching tolerance",
+        )
+        command.add_argument(
+            "--submap-keyframes",
+            type=int,
+            default=8,
+            help="number of recent keyframes in the local submap",
+        )
+        command.add_argument(
+            "--search-xy-m",
+            type=float,
+            default=0.8,
+            help="translation search radius around prediction in meters",
+        )
+        command.add_argument(
+            "--search-step-m",
+            type=float,
+            default=0.4,
+            help="translation search step in meters",
+        )
+        command.add_argument(
+            "--search-theta-deg",
+            type=float,
+            default=8.0,
+            help="heading search radius around prediction in degrees",
+        )
+        command.add_argument(
+            "--search-theta-step-deg",
+            type=float,
+            default=4.0,
+            help="heading search step in degrees",
+        )
+        command.set_defaults(func=run_stage7)
 
     return parser
 
