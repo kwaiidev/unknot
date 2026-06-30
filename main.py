@@ -56,6 +56,14 @@ class HeadingSample:
     valid_points: int
 
 
+@dataclass(frozen=True)
+class LoopClosure:
+    from_ordinal: int
+    to_ordinal: int
+    raw_distance_m: float
+    signature_distance: float
+
+
 def iter_scan_summaries(lidar_path: Path) -> Iterable[ScanSummary]:
     with lidar_path.open("r", encoding="utf-8") as scan_file:
         for line_number, line in enumerate(scan_file, start=1):
@@ -1602,6 +1610,193 @@ def write_heading_plot(
     image.save(output_path)
 
 
+def build_scan_signature(
+    scan: LocalScan,
+    bin_count: int,
+    max_range_m: float,
+) -> list[float]:
+    signature = [1.0] * bin_count
+    for x_m, y_m, _intensity in scan.points:
+        distance_m = math.hypot(x_m, y_m)
+        if distance_m <= 0.0 or distance_m > max_range_m:
+            continue
+
+        angle_rad = math.atan2(y_m, x_m) % (2.0 * math.pi)
+        bin_index = min(int(angle_rad / (2.0 * math.pi) * bin_count), bin_count - 1)
+        signature[bin_index] = min(signature[bin_index], distance_m / max_range_m)
+
+    return signature
+
+
+def shifted_signature_distance(
+    first: list[float],
+    second: list[float],
+    shift: int,
+    min_overlap_bins: int,
+) -> float:
+    overlap_count = 0
+    total_distance = 0.0
+    mismatch_count = 0
+    count = len(first)
+    for index, first_value in enumerate(first):
+        second_value = second[(index + shift) % count]
+        first_has_return = first_value < 1.0
+        second_has_return = second_value < 1.0
+        if first_has_return and second_has_return:
+            overlap_count += 1
+            total_distance += abs(first_value - second_value)
+        elif first_has_return != second_has_return:
+            mismatch_count += 1
+
+    if overlap_count < min_overlap_bins:
+        return 1.0
+
+    return total_distance / overlap_count + mismatch_count / count * 0.05
+
+
+def scan_signature_distance(
+    first: list[float],
+    second: list[float],
+    min_overlap_bins: int,
+) -> float:
+    shift_candidates = [
+        0,
+        len(first) // 4,
+        len(first) // 2,
+        len(first) * 3 // 4,
+    ]
+    return min(
+        shifted_signature_distance(first, second, shift, min_overlap_bins)
+        for shift in shift_candidates
+    )
+
+
+def find_loop_closures(
+    lidar_path: Path,
+    poses: list[Pose2D],
+    signature_bins: int,
+    signature_max_range_m: float,
+    min_separation: int,
+    max_raw_distance_m: float,
+    max_signature_distance: float,
+    min_overlap_bins: int,
+    max_closures: int,
+) -> list[LoopClosure]:
+    scan_indices = [pose.scan_index for pose in poses]
+    scans = list(iter_local_scans(lidar_path, scan_indices))
+    signatures = [
+        build_scan_signature(
+            scan=scan,
+            bin_count=signature_bins,
+            max_range_m=signature_max_range_m,
+        )
+        for scan in scans
+    ]
+
+    candidates = []
+    for to_ordinal, to_pose in enumerate(poses):
+        for from_ordinal in range(0, to_ordinal - min_separation):
+            from_pose = poses[from_ordinal]
+            raw_distance_m = math.hypot(
+                to_pose.x_m - from_pose.x_m,
+                to_pose.y_m - from_pose.y_m,
+            )
+            if raw_distance_m > max_raw_distance_m:
+                continue
+
+            signature_distance = scan_signature_distance(
+                signatures[from_ordinal],
+                signatures[to_ordinal],
+                min_overlap_bins=min_overlap_bins,
+            )
+            if signature_distance > max_signature_distance:
+                continue
+
+            candidates.append(
+                LoopClosure(
+                    from_ordinal=from_ordinal,
+                    to_ordinal=to_ordinal,
+                    raw_distance_m=raw_distance_m,
+                    signature_distance=signature_distance,
+                )
+            )
+
+    candidates.sort(key=lambda closure: closure.signature_distance)
+    selected = []
+    used_pairs = set()
+    for candidate in candidates:
+        from_bucket = candidate.from_ordinal // 10
+        to_bucket = candidate.to_ordinal // 10
+        bucket_pair = (from_bucket, to_bucket)
+        if bucket_pair in used_pairs:
+            continue
+
+        selected.append(candidate)
+        used_pairs.add(bucket_pair)
+        if len(selected) >= max_closures:
+            break
+
+    return selected
+
+
+def solve_loop_closure_graph(
+    poses: list[Pose2D],
+    closures: list[LoopClosure],
+    loop_weight: float,
+    odometry_weight: float,
+    anchor_weight: float,
+) -> list[Pose2D]:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("NumPy is required for Stage 10 loop closure") from exc
+
+    pose_count = len(poses)
+    if pose_count == 0:
+        return []
+
+    row_count = 1 + max(pose_count - 1, 0) + len(closures)
+    matrix = np.zeros((row_count, pose_count), dtype=float)
+    target_x = np.zeros(row_count, dtype=float)
+    target_y = np.zeros(row_count, dtype=float)
+
+    row = 0
+    matrix[row, 0] = anchor_weight
+    target_x[row] = poses[0].x_m * anchor_weight
+    target_y[row] = poses[0].y_m * anchor_weight
+    row += 1
+
+    for ordinal in range(1, pose_count):
+        previous_pose = poses[ordinal - 1]
+        pose = poses[ordinal]
+        matrix[row, ordinal - 1] = -odometry_weight
+        matrix[row, ordinal] = odometry_weight
+        target_x[row] = (pose.x_m - previous_pose.x_m) * odometry_weight
+        target_y[row] = (pose.y_m - previous_pose.y_m) * odometry_weight
+        row += 1
+
+    for closure in closures:
+        matrix[row, closure.from_ordinal] = -loop_weight
+        matrix[row, closure.to_ordinal] = loop_weight
+        target_x[row] = 0.0
+        target_y[row] = 0.0
+        row += 1
+
+    solved_x = np.linalg.lstsq(matrix, target_x, rcond=None)[0]
+    solved_y = np.linalg.lstsq(matrix, target_y, rcond=None)[0]
+
+    return [
+        Pose2D(
+            scan_index=pose.scan_index,
+            x_m=float(solved_x[ordinal]),
+            y_m=float(solved_y[ordinal]),
+            theta_rad=pose.theta_rad,
+            score=pose.score,
+        )
+        for ordinal, pose in enumerate(poses)
+    ]
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -1834,6 +2029,84 @@ def run_stage9(args: argparse.Namespace) -> None:
     )
     print(f"estimated {len(poses)} poses for first {limit} scans")
     print(f"wrote {output_path}")
+
+
+def run_stage10(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.max_points <= 0:
+        raise ValueError("--max-points must be greater than 0")
+    if args.search_step_m <= 0.0:
+        raise ValueError("--search-step-m must be greater than 0")
+    if args.search_theta_step_deg <= 0.0:
+        raise ValueError("--search-theta-step-deg must be greater than 0")
+
+    limit = args.limit or count_scans(args.lidar)
+    poses = estimate_odometry(
+        lidar_path=args.lidar,
+        limit=limit,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+        max_points=args.max_points,
+        min_range_m=args.min_range_m,
+        max_range_m=args.max_range_m,
+        cell_size_m=args.cell_size_m,
+        inflation_cells=args.inflation_cells,
+        submap_keyframes=args.submap_keyframes,
+        search_xy_m=args.search_xy_m,
+        search_step_m=args.search_step_m,
+        search_theta_deg=args.search_theta_deg,
+        search_theta_step_deg=args.search_theta_step_deg,
+    )
+    closures = find_loop_closures(
+        lidar_path=args.lidar,
+        poses=poses,
+        signature_bins=args.signature_bins,
+        signature_max_range_m=args.signature_max_range_m,
+        min_separation=args.min_loop_separation,
+        max_raw_distance_m=args.max_loop_distance_m,
+        max_signature_distance=args.max_signature_distance,
+        min_overlap_bins=args.min_overlap_bins,
+        max_closures=args.max_closures,
+    )
+    corrected_poses = solve_loop_closure_graph(
+        poses=poses,
+        closures=closures,
+        loop_weight=args.loop_weight,
+        odometry_weight=args.odometry_weight,
+        anchor_weight=args.anchor_weight,
+    )
+
+    before_path = args.out_dir / "08_before_loop_closure.png"
+    after_path = args.out_dir / "09_after_loop_closure.png"
+    subtitle = (
+        f"{len(poses)} keyframe poses from first {limit} scans | "
+        f"{len(closures)} accepted loop closures"
+    )
+    write_odometry_preview(
+        poses=poses,
+        output_path=before_path,
+        limit=limit,
+        stride=args.stride,
+        title="Stage 10 before loop closure",
+        subtitle=subtitle,
+    )
+    write_odometry_preview(
+        poses=corrected_poses,
+        output_path=after_path,
+        limit=limit,
+        stride=args.stride,
+        title="Stage 10 after loop closure",
+        subtitle=subtitle,
+    )
+    print(f"estimated {len(poses)} poses for first {limit} scans")
+    print(f"accepted {len(closures)} loop closures")
+    if closures:
+        best = min(closure.signature_distance for closure in closures)
+        worst = max(closure.signature_distance for closure in closures)
+        print(f"loop signature distance range: {best:.3f} to {worst:.3f}")
+    print(f"wrote {before_path}")
+    print(f"wrote {after_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2382,6 +2655,162 @@ def build_parser() -> argparse.ArgumentParser:
             help="heading search step in degrees",
         )
         command.set_defaults(func=run_stage9)
+
+    for command_name in ("stage10", "loop-closure"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 10 before/after loop-closure plots",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--limit",
+            type=int,
+            help="scan prefix limit; defaults to the full dataset",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="keyframe stride in scans",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--max-points",
+            type=int,
+            default=120,
+            help="maximum scan points used by the matcher",
+        )
+        command.add_argument(
+            "--min-range-m",
+            type=float,
+            default=0.7,
+            help="minimum point range used by the matcher",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum point range used by the matcher",
+        )
+        command.add_argument(
+            "--cell-size-m",
+            type=float,
+            default=0.25,
+            help="submap occupancy grid cell size in meters",
+        )
+        command.add_argument(
+            "--inflation-cells",
+            type=int,
+            default=1,
+            help="cell inflation radius for scan matching tolerance",
+        )
+        command.add_argument(
+            "--submap-keyframes",
+            type=int,
+            default=8,
+            help="number of recent keyframes in the local submap",
+        )
+        command.add_argument(
+            "--search-xy-m",
+            type=float,
+            default=0.8,
+            help="translation search radius around prediction in meters",
+        )
+        command.add_argument(
+            "--search-step-m",
+            type=float,
+            default=0.4,
+            help="translation search step in meters",
+        )
+        command.add_argument(
+            "--search-theta-deg",
+            type=float,
+            default=8.0,
+            help="heading search radius around prediction in degrees",
+        )
+        command.add_argument(
+            "--search-theta-step-deg",
+            type=float,
+            default=4.0,
+            help="heading search step in degrees",
+        )
+        command.add_argument(
+            "--signature-bins",
+            type=int,
+            default=72,
+            help="range-signature bins used for loop candidate rejection",
+        )
+        command.add_argument(
+            "--signature-max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum range encoded in loop signatures",
+        )
+        command.add_argument(
+            "--min-loop-separation",
+            type=int,
+            default=80,
+            help="minimum keyframe ordinal separation for loop candidates",
+        )
+        command.add_argument(
+            "--max-loop-distance-m",
+            type=float,
+            default=5.0,
+            help="maximum raw-pose distance for loop candidates",
+        )
+        command.add_argument(
+            "--max-signature-distance",
+            type=float,
+            default=0.10,
+            help="maximum scan-signature distance for accepted loops",
+        )
+        command.add_argument(
+            "--min-overlap-bins",
+            type=int,
+            default=10,
+            help="minimum overlapping signature bins for loop comparison",
+        )
+        command.add_argument(
+            "--max-closures",
+            type=int,
+            default=40,
+            help="maximum accepted loop closures",
+        )
+        command.add_argument(
+            "--loop-weight",
+            type=float,
+            default=0.35,
+            help="weight for loop-closure constraints",
+        )
+        command.add_argument(
+            "--odometry-weight",
+            type=float,
+            default=1.0,
+            help="weight for adjacent odometry constraints",
+        )
+        command.add_argument(
+            "--anchor-weight",
+            type=float,
+            default=100.0,
+            help="weight anchoring the first pose",
+        )
+        command.set_defaults(func=run_stage10)
 
     return parser
 
