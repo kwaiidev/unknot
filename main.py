@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,13 @@ class ScanSummary:
     valid_point_count: int
     min_distance_mm: float | None
     max_distance_mm: float | None
+
+
+@dataclass(frozen=True)
+class LocalScan:
+    scan_index: int
+    timestamp_ms: int
+    points: list[tuple[float, float, int]]
 
 
 def iter_scan_summaries(lidar_path: Path) -> Iterable[ScanSummary]:
@@ -59,6 +67,59 @@ def iter_scan_summaries(lidar_path: Path) -> Iterable[ScanSummary]:
                 min_distance_mm=min_distance_mm,
                 max_distance_mm=max_distance_mm,
             )
+
+
+def scan_points_to_cartesian(samples: list[list[float]]) -> list[tuple[float, float, int]]:
+    points = []
+    for distance_mm, intensity, angle_q6 in samples:
+        distance_mm = float(distance_mm)
+        if distance_mm <= 0.0:
+            continue
+
+        angle_rad = float(angle_q6) / 64.0 * math.pi / 180.0
+        distance_m = distance_mm / 1000.0
+        points.append(
+            (
+                distance_m * math.cos(angle_rad),
+                distance_m * math.sin(angle_rad),
+                int(intensity),
+            )
+        )
+    return points
+
+
+def iter_local_scans(
+    lidar_path: Path,
+    selected_indices: Iterable[int],
+) -> Iterable[LocalScan]:
+    remaining_indices = {index for index in selected_indices if index >= 0}
+    if not remaining_indices:
+        return
+
+    scan_index = -1
+    with lidar_path.open("r", encoding="utf-8") as scan_file:
+        for line_number, line in enumerate(scan_file, start=1):
+            if not line.strip():
+                continue
+
+            scan_index += 1
+            if scan_index not in remaining_indices:
+                continue
+
+            try:
+                timestamp_ms, samples = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON on line {line_number}: {exc}") from exc
+
+            remaining_indices.remove(scan_index)
+            yield LocalScan(
+                scan_index=scan_index,
+                timestamp_ms=int(timestamp_ms),
+                points=scan_points_to_cartesian(samples),
+            )
+
+            if not remaining_indices:
+                break
 
 
 def percentile(values: list[float], percentage: float) -> float:
@@ -143,6 +204,83 @@ def write_valid_points_plot(valid_counts: list[int], output_path: Path) -> None:
     image.save(output_path)
 
 
+def write_local_scan_plot(
+    scan: LocalScan,
+    output_path: Path,
+    max_range_m: float,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 2 PNGs") from exc
+
+    width = 900
+    height = 900
+    left = 68
+    right = 26
+    top = 54
+    bottom = 58
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    center_x = left + plot_width / 2.0
+    center_y = top + plot_height / 2.0
+    scale = min(plot_width, plot_height) / (2.0 * max_range_m)
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    grid_color = (224, 224, 224)
+    axis_color = (70, 70, 70)
+    point_color = (109, 40, 217)
+    origin_color = (220, 38, 38)
+
+    draw.rectangle((left, top, width - right, height - bottom), outline=axis_color)
+    grid_extent_m = int(max_range_m // 5) * 5
+    for value_m in range(-grid_extent_m, grid_extent_m + 1, 5):
+        x = center_x + value_m * scale
+        y = center_y - value_m * scale
+        draw.line([(x, top), (x, height - bottom)], fill=grid_color)
+        draw.line([(left, y), (width - right, y)], fill=grid_color)
+        if value_m != 0:
+            draw.text((x - 8, height - bottom + 12), str(value_m), fill=axis_color)
+            draw.text((12, y - 7), str(value_m), fill=axis_color)
+
+    draw.line([(center_x, top), (center_x, height - bottom)], fill=axis_color)
+    draw.line([(left, center_y), (width - right, center_y)], fill=axis_color)
+
+    for range_m in range(5, grid_extent_m + 1, 5):
+        radius = range_m * scale
+        draw.ellipse(
+            (
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+            ),
+            outline=(238, 238, 238),
+        )
+
+    for x_m, y_m, _intensity in scan.points:
+        x = round(center_x + x_m * scale)
+        y = round(center_y - y_m * scale)
+        if left <= x <= width - right and top <= y <= height - bottom:
+            draw.rectangle((x - 1, y - 1, x + 1, y + 1), fill=point_color)
+
+    draw.line([(center_x - 7, center_y), (center_x + 7, center_y)], fill=origin_color)
+    draw.line([(center_x, center_y - 7), (center_x, center_y + 7)], fill=origin_color)
+    draw.text(
+        (left, 16),
+        (
+            f"scan {scan.scan_index:05d} | timestamp {scan.timestamp_ms} | "
+            f"valid points {len(scan.points)}"
+        ),
+        fill=axis_color,
+    )
+    draw.text((width // 2 - 45, height - 26), "x meters", fill=axis_color)
+    draw.text((10, top - 24), "y meters", fill=axis_color)
+    image.save(output_path)
+
+
 def collect_stage1(lidar_path: Path) -> tuple[str, list[int]]:
     timestamps = []
     point_counts = []
@@ -217,6 +355,33 @@ def run_stage1(args: argparse.Namespace) -> None:
     print(f"wrote {plot_path}")
 
 
+def parse_indices(raw_indices: str) -> list[int]:
+    return [
+        int(raw_index.strip())
+        for raw_index in raw_indices.split(",")
+        if raw_index.strip()
+    ]
+
+
+def default_scan_indices(start: int, stride: int, count: int) -> list[int]:
+    return [start + stride * offset for offset in range(count)]
+
+
+def run_stage2(args: argparse.Namespace) -> None:
+    scan_dir = args.out_dir / "scans"
+    scan_dir.mkdir(parents=True, exist_ok=True)
+
+    indices = (
+        parse_indices(args.indices)
+        if args.indices
+        else default_scan_indices(args.start, args.stride, args.count)
+    )
+    for scan in iter_local_scans(args.lidar, indices):
+        output_path = scan_dir / f"scan_{scan.scan_index:05d}.png"
+        write_local_scan_plot(scan, output_path, args.max_range_m)
+        print(f"wrote {output_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="LiDAR trajectory reconstruction diagnostics."
@@ -241,6 +406,53 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
         )
         command.set_defaults(func=run_stage1)
+
+    for command_name in ("stage2", "plot-scans"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 2 local scan plots",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--indices",
+            help="comma-separated scan indices to plot",
+        )
+        command.add_argument(
+            "--start",
+            type=int,
+            default=0,
+            help="first scan index for default sampling",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=1000,
+            help="scan index stride for default sampling",
+        )
+        command.add_argument(
+            "--count",
+            type=int,
+            default=20,
+            help="number of scan plots for default sampling",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=16.0,
+            help="fixed plot radius in meters",
+        )
+        command.set_defaults(func=run_stage2)
 
     return parser
 
