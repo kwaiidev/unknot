@@ -122,6 +122,15 @@ def iter_local_scans(
                 break
 
 
+def count_scans(lidar_path: Path) -> int:
+    scan_count = 0
+    with lidar_path.open("r", encoding="utf-8") as scan_file:
+        for line in scan_file:
+            if line.strip():
+                scan_count += 1
+    return scan_count
+
+
 def percentile(values: list[float], percentage: float) -> float:
     if not values:
         return 0.0
@@ -281,6 +290,152 @@ def write_local_scan_plot(
     image.save(output_path)
 
 
+def interpolate_color(
+    low_color: tuple[int, int, int],
+    high_color: tuple[int, int, int],
+    weight: float,
+) -> tuple[int, int, int]:
+    return tuple(
+        round(low + (high - low) * weight)
+        for low, high in zip(low_color, high_color)
+    )
+
+
+def distance_color(distance_m: float, max_range_m: float) -> tuple[int, int, int]:
+    anchors = [
+        (0.0, (253, 231, 37)),
+        (0.25, (94, 201, 98)),
+        (0.5, (33, 145, 140)),
+        (0.75, (59, 82, 139)),
+        (1.0, (68, 1, 84)),
+    ]
+    ratio = min(max(distance_m / max_range_m, 0.0), 1.0)
+
+    for (low_ratio, low_color), (high_ratio, high_color) in zip(anchors, anchors[1:]):
+        if ratio <= high_ratio:
+            weight = (ratio - low_ratio) / (high_ratio - low_ratio)
+            return interpolate_color(low_color, high_color, weight)
+
+    return anchors[-1][1]
+
+
+def build_range_image(
+    lidar_path: Path,
+    output_path: Path,
+    width: int,
+    angle_bins: int,
+    max_range_m: float,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 3 PNG") from exc
+
+    scan_count = count_scans(lidar_path)
+    if scan_count == 0:
+        raise ValueError(f"no scans found in {lidar_path}")
+
+    pixel_count = width * angle_bins
+    ranges_m = [max_range_m] * pixel_count
+    has_return = bytearray(pixel_count)
+
+    scan_index = -1
+    with lidar_path.open("r", encoding="utf-8") as scan_file:
+        for line_number, line in enumerate(scan_file, start=1):
+            if not line.strip():
+                continue
+
+            scan_index += 1
+            try:
+                _timestamp_ms, samples = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON on line {line_number}: {exc}") from exc
+
+            x = scan_index * (width - 1) // max(scan_count - 1, 1)
+            for distance_mm, _intensity, angle_q6 in samples:
+                distance_m = float(distance_mm) / 1000.0
+                if distance_m <= 0.0 or distance_m > max_range_m:
+                    continue
+
+                angle_degrees = (float(angle_q6) / 64.0) % 360.0
+                angle_bin = min(int(angle_degrees / 360.0 * angle_bins), angle_bins - 1)
+                y = angle_bins - 1 - angle_bin
+                pixel_index = y * width + x
+                if not has_return[pixel_index] or distance_m < ranges_m[pixel_index]:
+                    ranges_m[pixel_index] = distance_m
+                    has_return[pixel_index] = 1
+
+    left = 74
+    right = 118
+    top = 42
+    bottom = 58
+    image = Image.new(
+        "RGB",
+        (width + left + right, angle_bins + top + bottom),
+        "white",
+    )
+    draw = ImageDraw.Draw(image)
+    pixels = image.load()
+
+    empty_color = (18, 18, 26)
+    grid_color = (225, 225, 225)
+    axis_color = (64, 64, 64)
+
+    for y in range(angle_bins):
+        for x in range(width):
+            pixel_index = y * width + x
+            pixels[left + x, top + y] = (
+                distance_color(ranges_m[pixel_index], max_range_m)
+                if has_return[pixel_index]
+                else empty_color
+            )
+
+    for angle_label in range(0, 361, 90):
+        y = top + angle_bins - round(angle_label / 360.0 * (angle_bins - 1)) - 1
+        draw.line([(left, y), (left + width - 1, y)], fill=grid_color)
+        draw.text((14, y - 7), f"{angle_label}", fill=axis_color)
+
+    for step in range(6):
+        x = left + round((width - 1) * step / 5)
+        label = round((scan_count - 1) * step / 5)
+        draw.line([(x, top), (x, top + angle_bins - 1)], fill=grid_color)
+        draw.text((x - 20, top + angle_bins + 12), str(label), fill=axis_color)
+
+    draw.rectangle(
+        (left, top, left + width - 1, top + angle_bins - 1),
+        outline=axis_color,
+    )
+    draw.text((left, 14), "Range image: scan index vs LiDAR angle", fill=axis_color)
+    draw.text((left + width // 2 - 38, top + angle_bins + 34), "scan index", fill=axis_color)
+    draw.text((10, top - 24), "angle deg", fill=axis_color)
+
+    legend_x = left + width + 28
+    legend_y = top
+    legend_height = angle_bins
+    for offset in range(legend_height):
+        ratio = offset / max(legend_height - 1, 1)
+        distance_m = ratio * max_range_m
+        color = distance_color(distance_m, max_range_m)
+        draw.line(
+            [(legend_x, legend_y + offset), (legend_x + 24, legend_y + offset)],
+            fill=color,
+        )
+
+    draw.rectangle(
+        (legend_x, legend_y, legend_x + 24, legend_y + legend_height - 1),
+        outline=axis_color,
+    )
+    draw.text((legend_x + 34, legend_y - 7), "0 m", fill=axis_color)
+    draw.text(
+        (legend_x + 34, legend_y + legend_height - 10),
+        f"{max_range_m:g} m",
+        fill=axis_color,
+    )
+    draw.text((legend_x, top + angle_bins + 12), "distance", fill=axis_color)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+
+
 def collect_stage1(lidar_path: Path) -> tuple[str, list[int]]:
     timestamps = []
     point_counts = []
@@ -382,6 +537,18 @@ def run_stage2(args: argparse.Namespace) -> None:
         print(f"wrote {output_path}")
 
 
+def run_stage3(args: argparse.Namespace) -> None:
+    output_path = args.out_dir / "02_range_image.png"
+    build_range_image(
+        lidar_path=args.lidar,
+        output_path=output_path,
+        width=args.width,
+        angle_bins=args.angle_bins,
+        max_range_m=args.max_range_m,
+    )
+    print(f"wrote {output_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="LiDAR trajectory reconstruction diagnostics."
@@ -453,6 +620,43 @@ def build_parser() -> argparse.ArgumentParser:
             help="fixed plot radius in meters",
         )
         command.set_defaults(func=run_stage2)
+
+    for command_name in ("stage3", "range-image"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 3 scan-index/angle range image",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--width",
+            type=int,
+            default=1600,
+            help="range image plot width in pixels",
+        )
+        command.add_argument(
+            "--angle-bins",
+            type=int,
+            default=720,
+            help="number of vertical angle bins",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=16.0,
+            help="maximum distance shown in meters",
+        )
+        command.set_defaults(func=run_stage3)
 
     return parser
 
