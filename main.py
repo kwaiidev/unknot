@@ -881,50 +881,74 @@ def grid_cell(x_m: float, y_m: float, cell_size_m: float) -> tuple[int, int]:
     )
 
 
-def inflate_cells(
-    occupied_cells: set[tuple[int, int]],
-    radius_cells: int,
-) -> set[tuple[int, int]]:
-    inflated = set()
-    for cell_x, cell_y in occupied_cells:
-        for offset_x in range(-radius_cells, radius_cells + 1):
-            for offset_y in range(-radius_cells, radius_cells + 1):
-                inflated.add((cell_x + offset_x, cell_y + offset_y))
-    return inflated
+def normalize_angle_rad(angle_rad: float) -> float:
+    return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def build_submap_cells(
+def normalize_line_angle_delta_rad(angle_rad: float) -> float:
+    return (angle_rad + math.pi / 2.0) % math.pi - math.pi / 2.0
+
+
+def build_submap_distance_lookup(
     world_scans: list[list[tuple[float, float]]],
     cell_size_m: float,
     inflation_cells: int,
     submap_keyframes: int,
-) -> set[tuple[int, int]]:
+) -> tuple[dict[tuple[int, int], float], float]:
     occupied = set()
     for world_points in world_scans[-submap_keyframes:]:
         for x_m, y_m in world_points:
             occupied.add(grid_cell(x_m, y_m, cell_size_m))
-    return inflate_cells(occupied, inflation_cells)
+
+    radius_cells = max(inflation_cells + 2, 1)
+    max_distance_m = radius_cells * cell_size_m
+    offsets = []
+    for offset_x in range(-radius_cells, radius_cells + 1):
+        for offset_y in range(-radius_cells, radius_cells + 1):
+            distance_m = math.hypot(offset_x, offset_y) * cell_size_m
+            if distance_m <= max_distance_m:
+                offsets.append((offset_x, offset_y, distance_m))
+
+    distance_lookup = {}
+    for cell_x, cell_y in occupied:
+        for offset_x, offset_y, distance_m in offsets:
+            cell = (cell_x + offset_x, cell_y + offset_y)
+            previous_distance_m = distance_lookup.get(cell)
+            if previous_distance_m is None or distance_m < previous_distance_m:
+                distance_lookup[cell] = distance_m
+
+    return distance_lookup, max_distance_m
 
 
 def score_pose(
     points: list[tuple[float, float]],
     pose: Pose2D,
-    submap_cells: set[tuple[int, int]],
+    submap_distances: dict[tuple[int, int], float],
     cell_size_m: float,
+    max_distance_m: float,
 ) -> float:
-    if not points or not submap_cells:
+    if not points or not submap_distances:
         return 0.0
 
     cos_theta = math.cos(pose.theta_rad)
     sin_theta = math.sin(pose.theta_rad)
-    match_count = 0
+    total_distance_m = 0.0
+    matched_count = 0
     for x_m, y_m in points:
         world_x = pose.x_m + cos_theta * x_m - sin_theta * y_m
         world_y = pose.y_m + sin_theta * x_m + cos_theta * y_m
-        if grid_cell(world_x, world_y, cell_size_m) in submap_cells:
-            match_count += 1
+        distance_m = submap_distances.get(
+            grid_cell(world_x, world_y, cell_size_m),
+            max_distance_m,
+        )
+        total_distance_m += distance_m
+        if distance_m < max_distance_m:
+            matched_count += 1
 
-    return match_count / len(points)
+    mean_distance_m = total_distance_m / len(points)
+    unmatched_ratio = 1.0 - matched_count / len(points)
+    distance_error = mean_distance_m + unmatched_ratio * max_distance_m * 0.7
+    return 1.0 / (1.0 + distance_error)
 
 
 def frange(start: float, stop: float, step: float) -> list[float]:
@@ -951,6 +975,9 @@ def run_odometry_estimation(
     search_step_m: float,
     search_theta_deg: float,
     search_theta_step_deg: float,
+    heading_weight: float,
+    heading_min_confidence: float,
+    max_step_m: float,
     debug_keyframe_ordinals: set[int] | None = None,
 ) -> tuple[list[Pose2D], list[MatchDebug]]:
     debug_keyframe_ordinals = debug_keyframe_ordinals or set()
@@ -978,6 +1005,17 @@ def run_odometry_estimation(
         )
         for scan in scans
     ]
+    line_angles = [
+        dominant_structure_angle(
+            points=scan.points,
+            bin_count=72,
+            min_segment_m=0.05,
+            max_segment_m=1.2,
+            min_range_m=min_range_m,
+            max_range_m=max_range_m,
+        )
+        for scan in scans
+    ]
 
     poses = [Pose2D(scans[0].scan_index, 0.0, 0.0, 0.0, 1.0)]
     world_scans = [transform_xy_points(local_scans[0], poses[0])]
@@ -998,13 +1036,27 @@ def run_odometry_estimation(
         for value in frange(-search_theta_deg, search_theta_deg, search_theta_step_deg)
     ]
 
-    for scan, local_points in zip(scans[1:], local_scans[1:]):
+    for keyframe_ordinal, (scan, local_points) in enumerate(
+        zip(scans[1:], local_scans[1:]),
+        start=1,
+    ):
         previous_pose = poses[-1]
         if len(poses) >= 2:
             previous_previous_pose = poses[-2]
             delta_x = previous_pose.x_m - previous_previous_pose.x_m
             delta_y = previous_pose.y_m - previous_previous_pose.y_m
-            delta_theta = previous_pose.theta_rad - previous_previous_pose.theta_rad
+            delta_theta = normalize_angle_rad(
+                previous_pose.theta_rad - previous_previous_pose.theta_rad
+            )
+            if max_step_m > 0.0:
+                step_m = math.hypot(delta_x, delta_y)
+                if step_m > max_step_m:
+                    scale = max_step_m / step_m
+                    delta_x *= scale
+                    delta_y *= scale
+            max_delta_theta = math.radians(search_theta_deg)
+            if abs(delta_theta) > max_delta_theta:
+                delta_theta = math.copysign(max_delta_theta, delta_theta)
         else:
             delta_x = 0.0
             delta_y = 0.0
@@ -1022,12 +1074,25 @@ def run_odometry_estimation(
             for world_points in world_scans[-submap_keyframes:]
             for point in world_points
         ]
-        submap_cells = build_submap_cells(
+        submap_distances, max_distance_m = build_submap_distance_lookup(
             world_scans=world_scans,
             cell_size_m=cell_size_m,
             inflation_cells=inflation_cells,
             submap_keyframes=submap_keyframes,
         )
+        previous_line_angle, previous_line_confidence = line_angles[keyframe_ordinal - 1]
+        current_line_angle, current_line_confidence = line_angles[keyframe_ordinal]
+        expected_theta = None
+        if (
+            previous_line_angle is not None
+            and current_line_angle is not None
+            and previous_line_confidence >= heading_min_confidence
+            and current_line_confidence >= heading_min_confidence
+        ):
+            line_delta = normalize_line_angle_delta_rad(
+                current_line_angle - previous_line_angle
+            )
+            expected_theta = previous_pose.theta_rad - line_delta
 
         best_pose = predicted_pose
         best_score = -1.0
@@ -1045,13 +1110,35 @@ def run_odometry_estimation(
                     score = score_pose(
                         points=local_points,
                         pose=candidate,
-                        submap_cells=submap_cells,
+                        submap_distances=submap_distances,
                         cell_size_m=cell_size_m,
+                        max_distance_m=max_distance_m,
                     )
                     movement_penalty = (
-                        abs(offset_x) + abs(offset_y) + abs(offset_theta) * 2.0
-                    ) * 0.01
-                    adjusted_score = score - movement_penalty
+                        (abs(offset_x) + abs(offset_y)) * 0.04
+                        + abs(offset_theta) * 0.2
+                    )
+                    move_x = candidate.x_m - previous_pose.x_m
+                    move_y = candidate.y_m - previous_pose.y_m
+                    previous_cos = math.cos(previous_pose.theta_rad)
+                    previous_sin = math.sin(previous_pose.theta_rad)
+                    forward_m = previous_cos * move_x + previous_sin * move_y
+                    lateral_m = -previous_sin * move_x + previous_cos * move_y
+                    aisle_motion_penalty = abs(lateral_m) * 0.08
+                    if forward_m < 0.0:
+                        aisle_motion_penalty += abs(forward_m) * 0.03
+                    heading_penalty = (
+                        heading_weight
+                        * abs(normalize_angle_rad(theta - expected_theta))
+                        if expected_theta is not None
+                        else 0.0
+                    )
+                    adjusted_score = (
+                        score
+                        - movement_penalty
+                        - aisle_motion_penalty
+                        - heading_penalty
+                    )
                     if adjusted_score > best_score:
                         best_score = adjusted_score
                         best_pose = Pose2D(
@@ -1063,7 +1150,6 @@ def run_odometry_estimation(
                         )
 
         current_world_points = transform_xy_points(local_points, best_pose)
-        keyframe_ordinal = len(poses)
         if keyframe_ordinal in debug_keyframe_ordinals:
             debug_matches.append(
                 MatchDebug(
@@ -1096,6 +1182,9 @@ def estimate_odometry(
     search_step_m: float,
     search_theta_deg: float,
     search_theta_step_deg: float,
+    heading_weight: float,
+    heading_min_confidence: float,
+    max_step_m: float,
 ) -> list[Pose2D]:
     poses, _debug_matches = run_odometry_estimation(
         lidar_path=lidar_path,
@@ -1112,6 +1201,9 @@ def estimate_odometry(
         search_step_m=search_step_m,
         search_theta_deg=search_theta_deg,
         search_theta_step_deg=search_theta_step_deg,
+        heading_weight=heading_weight,
+        heading_min_confidence=heading_min_confidence,
+        max_step_m=max_step_m,
     )
 
     return poses
@@ -1797,6 +1889,200 @@ def solve_loop_closure_graph(
     ]
 
 
+def extract_reference_path_points(reference_path: Path) -> tuple[object, object]:
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("NumPy and Pillow are required for Stage 11 alignment") from exc
+
+    image = Image.open(reference_path).convert("RGB")
+    array = np.asarray(image)
+    red = array[:, :, 0]
+    green = array[:, :, 1]
+    blue = array[:, :, 2]
+    height, width = red.shape
+
+    purple_mask = (
+        (red > 70)
+        & (blue > 120)
+        & (green < 120)
+        & (blue > green + 40)
+        & (red > green + 30)
+    )
+    legend_mask = (
+        (np.indices((height, width))[1] > width * 0.45)
+        & (np.indices((height, width))[0] > height * 0.82)
+    )
+    purple_mask &= ~legend_mask
+
+    y_indices, x_indices = np.nonzero(purple_mask)
+    if len(x_indices) == 0:
+        raise ValueError(f"could not detect purple reference trajectory in {reference_path}")
+
+    points = np.column_stack((x_indices.astype(float), y_indices.astype(float)))
+    return image, points
+
+
+def pca_angle(points: object) -> float:
+    import numpy as np
+
+    centered = points - points.mean(axis=0)
+    covariance = centered.T @ centered / max(len(points) - 1, 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    vector = eigenvectors[:, int(np.argmax(eigenvalues))]
+    return math.atan2(float(vector[1]), float(vector[0]))
+
+
+def sample_array(points: object, max_count: int) -> object:
+    import numpy as np
+
+    if len(points) <= max_count:
+        return points
+    indices = np.linspace(0, len(points) - 1, max_count).astype(int)
+    return points[indices]
+
+
+def mean_nearest_distance(source_points: object, target_points: object) -> float:
+    import numpy as np
+
+    if len(source_points) == 0 or len(target_points) == 0:
+        return float("inf")
+
+    distances = []
+    for start in range(0, len(source_points), 200):
+        chunk = source_points[start : start + 200]
+        squared = ((chunk[:, None, :] - target_points[None, :, :]) ** 2).sum(axis=2)
+        distances.extend(np.sqrt(squared.min(axis=1)).tolist())
+    return float(np.mean(distances))
+
+
+def align_poses_to_reference(
+    poses: list[Pose2D],
+    reference_points: object,
+    image_size: tuple[int, int],
+) -> tuple[list[tuple[float, float]], float]:
+    import numpy as np
+
+    if not poses:
+        return [], 0.0
+
+    source = np.array([[pose.x_m, -pose.y_m] for pose in poses], dtype=float)
+    source_center = source.mean(axis=0)
+    target_center = reference_points.mean(axis=0)
+    target_angle = pca_angle(reference_points)
+    target_centered = reference_points - target_center
+    target_diag = np.linalg.norm(np.ptp(target_centered, axis=0))
+    target_sample = sample_array(reference_points, 3500)
+
+    best_points = None
+    best_score = float("inf")
+    for mirror_x in (1.0, -1.0):
+        for mirror_y in (1.0, -1.0):
+            reflected = (source - source_center) * np.array([mirror_x, mirror_y])
+            source_angle = pca_angle(reflected)
+            for angle_offset in (0.0, math.pi / 2.0, math.pi, math.pi * 3.0 / 2.0):
+                theta = target_angle - source_angle + angle_offset
+                cos_theta = math.cos(theta)
+                sin_theta = math.sin(theta)
+                rotation = np.array(
+                    [
+                        [cos_theta, -sin_theta],
+                        [sin_theta, cos_theta],
+                    ]
+                )
+                rotated = reflected @ rotation.T
+                source_diag = max(np.linalg.norm(np.ptp(rotated, axis=0)), 1e-6)
+                scale = target_diag / source_diag
+                transformed = rotated * scale + target_center
+
+                width, height = image_size
+                outside = (
+                    (transformed[:, 0] < 0)
+                    | (transformed[:, 0] >= width)
+                    | (transformed[:, 1] < 0)
+                    | (transformed[:, 1] >= height)
+                ).mean()
+                source_sample = sample_array(transformed, 1000)
+                score = mean_nearest_distance(source_sample, target_sample) + outside * 100.0
+                if score < best_score:
+                    best_score = score
+                    best_points = transformed
+
+    return [tuple(point) for point in best_points], best_score
+
+
+def write_final_aligned_render(
+    poses: list[Pose2D],
+    reference_path: Path,
+    output_path: Path,
+    background_opacity: float,
+) -> float:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 11 PNG") from exc
+
+    reference_image, reference_points = extract_reference_path_points(reference_path)
+    aligned_points, fit_score = align_poses_to_reference(
+        poses=poses,
+        reference_points=reference_points,
+        image_size=reference_image.size,
+    )
+
+    white = Image.new("RGB", reference_image.size, "white")
+    background = Image.blend(white, reference_image, background_opacity).convert("RGBA")
+    overlay = Image.new("RGBA", reference_image.size, (255, 255, 255, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    if len(aligned_points) >= 2:
+        draw.line(aligned_points, fill=(126, 34, 206, 255), width=6)
+        for point in aligned_points[:: max(len(aligned_points) // 30, 1)]:
+            x, y = point
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(126, 34, 206, 255))
+
+    if aligned_points:
+        start_x, start_y = aligned_points[0]
+        end_x, end_y = aligned_points[-1]
+        draw.ellipse(
+            (start_x - 9, start_y - 9, start_x + 9, start_y + 9),
+            fill=(34, 197, 94, 255),
+        )
+        draw.ellipse(
+            (end_x - 9, end_y - 9, end_x + 9, end_y + 9),
+            fill=(220, 38, 38, 255),
+        )
+
+    legend_x = 36
+    legend_y = 34
+    draw.rectangle(
+        (legend_x - 14, legend_y - 14, legend_x + 440, legend_y + 108),
+        fill=(255, 255, 255, 220),
+        outline=(180, 180, 180, 255),
+    )
+    draw.line(
+        [(legend_x, legend_y + 12), (legend_x + 70, legend_y + 12)],
+        fill=(126, 34, 206, 255),
+        width=6,
+    )
+    draw.text((legend_x + 84, legend_y), "reconstructed_lidar_trajectory", fill=(35, 35, 35))
+    draw.ellipse(
+        (legend_x, legend_y + 40, legend_x + 18, legend_y + 58),
+        fill=(34, 197, 94, 255),
+    )
+    draw.text((legend_x + 84, legend_y + 38), "start", fill=(35, 35, 35))
+    draw.ellipse(
+        (legend_x, legend_y + 72, legend_x + 18, legend_y + 90),
+        fill=(220, 38, 38, 255),
+    )
+    draw.text((legend_x + 84, legend_y + 70), "end", fill=(35, 35, 35))
+
+    final_image = Image.alpha_composite(background, overlay).convert("RGB")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    final_image.save(output_path)
+    return fit_score
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -1880,6 +2166,10 @@ def run_stage6(args: argparse.Namespace) -> None:
         raise ValueError("--search-step-m must be greater than 0")
     if args.search_theta_step_deg <= 0.0:
         raise ValueError("--search-theta-step-deg must be greater than 0")
+    if args.heading_weight < 0.0:
+        raise ValueError("--heading-weight must be non-negative")
+    if args.heading_min_confidence < 0.0:
+        raise ValueError("--heading-min-confidence must be non-negative")
 
     limits = parse_ints(args.limits)
     for limit in limits:
@@ -1898,6 +2188,9 @@ def run_stage6(args: argparse.Namespace) -> None:
             search_step_m=args.search_step_m,
             search_theta_deg=args.search_theta_deg,
             search_theta_step_deg=args.search_theta_step_deg,
+            heading_weight=args.heading_weight,
+            heading_min_confidence=args.heading_min_confidence,
+            max_step_m=args.max_step_m,
         )
         output_path = args.out_dir / f"05_odom_first_{limit}.png"
         write_odometry_preview(
@@ -1919,6 +2212,10 @@ def run_stage7(args: argparse.Namespace) -> None:
         raise ValueError("--search-step-m must be greater than 0")
     if args.search_theta_step_deg <= 0.0:
         raise ValueError("--search-theta-step-deg must be greater than 0")
+    if args.heading_weight < 0.0:
+        raise ValueError("--heading-weight must be non-negative")
+    if args.heading_min_confidence < 0.0:
+        raise ValueError("--heading-min-confidence must be non-negative")
 
     debug_keyframes = parse_ints(args.keyframes)
     if not debug_keyframes:
@@ -1940,6 +2237,9 @@ def run_stage7(args: argparse.Namespace) -> None:
         search_step_m=args.search_step_m,
         search_theta_deg=args.search_theta_deg,
         search_theta_step_deg=args.search_theta_step_deg,
+        heading_weight=args.heading_weight,
+        heading_min_confidence=args.heading_min_confidence,
+        max_step_m=args.max_step_m,
         debug_keyframe_ordinals=set(debug_keyframes),
     )
 
@@ -1997,6 +2297,10 @@ def run_stage9(args: argparse.Namespace) -> None:
         raise ValueError("--search-step-m must be greater than 0")
     if args.search_theta_step_deg <= 0.0:
         raise ValueError("--search-theta-step-deg must be greater than 0")
+    if args.heading_weight < 0.0:
+        raise ValueError("--heading-weight must be non-negative")
+    if args.heading_min_confidence < 0.0:
+        raise ValueError("--heading-min-confidence must be non-negative")
 
     limit = args.limit or count_scans(args.lidar)
     poses = estimate_odometry(
@@ -2014,6 +2318,9 @@ def run_stage9(args: argparse.Namespace) -> None:
         search_step_m=args.search_step_m,
         search_theta_deg=args.search_theta_deg,
         search_theta_step_deg=args.search_theta_step_deg,
+        heading_weight=args.heading_weight,
+        heading_min_confidence=args.heading_min_confidence,
+        max_step_m=args.max_step_m,
     )
     output_path = args.out_dir / "07_full_odometry_raw.png"
     write_odometry_preview(
@@ -2040,6 +2347,10 @@ def run_stage10(args: argparse.Namespace) -> None:
         raise ValueError("--search-step-m must be greater than 0")
     if args.search_theta_step_deg <= 0.0:
         raise ValueError("--search-theta-step-deg must be greater than 0")
+    if args.heading_weight < 0.0:
+        raise ValueError("--heading-weight must be non-negative")
+    if args.heading_min_confidence < 0.0:
+        raise ValueError("--heading-min-confidence must be non-negative")
 
     limit = args.limit or count_scans(args.lidar)
     poses = estimate_odometry(
@@ -2057,6 +2368,9 @@ def run_stage10(args: argparse.Namespace) -> None:
         search_step_m=args.search_step_m,
         search_theta_deg=args.search_theta_deg,
         search_theta_step_deg=args.search_theta_step_deg,
+        heading_weight=args.heading_weight,
+        heading_min_confidence=args.heading_min_confidence,
+        max_step_m=args.max_step_m,
     )
     closures = find_loop_closures(
         lidar_path=args.lidar,
@@ -2107,6 +2421,93 @@ def run_stage10(args: argparse.Namespace) -> None:
         print(f"loop signature distance range: {best:.3f} to {worst:.3f}")
     print(f"wrote {before_path}")
     print(f"wrote {after_path}")
+
+
+def run_stage11(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.max_points <= 0:
+        raise ValueError("--max-points must be greater than 0")
+    if args.search_step_m <= 0.0:
+        raise ValueError("--search-step-m must be greater than 0")
+    if args.search_theta_step_deg <= 0.0:
+        raise ValueError("--search-theta-step-deg must be greater than 0")
+    if args.heading_weight < 0.0:
+        raise ValueError("--heading-weight must be non-negative")
+    if args.heading_min_confidence < 0.0:
+        raise ValueError("--heading-min-confidence must be non-negative")
+
+    limit = args.limit or count_scans(args.lidar)
+    poses = estimate_odometry(
+        lidar_path=args.lidar,
+        limit=limit,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+        max_points=args.max_points,
+        min_range_m=args.min_range_m,
+        max_range_m=args.max_range_m,
+        cell_size_m=args.cell_size_m,
+        inflation_cells=args.inflation_cells,
+        submap_keyframes=args.submap_keyframes,
+        search_xy_m=args.search_xy_m,
+        search_step_m=args.search_step_m,
+        search_theta_deg=args.search_theta_deg,
+        search_theta_step_deg=args.search_theta_step_deg,
+        heading_weight=args.heading_weight,
+        heading_min_confidence=args.heading_min_confidence,
+        max_step_m=args.max_step_m,
+    )
+    closures = find_loop_closures(
+        lidar_path=args.lidar,
+        poses=poses,
+        signature_bins=args.signature_bins,
+        signature_max_range_m=args.signature_max_range_m,
+        min_separation=args.min_loop_separation,
+        max_raw_distance_m=args.max_loop_distance_m,
+        max_signature_distance=args.max_signature_distance,
+        min_overlap_bins=args.min_overlap_bins,
+        max_closures=args.max_closures,
+    )
+    corrected_poses = solve_loop_closure_graph(
+        poses=poses,
+        closures=closures,
+        loop_weight=args.loop_weight,
+        odometry_weight=args.odometry_weight,
+        anchor_weight=args.anchor_weight,
+    )
+
+    output_path = args.out_dir / "10_final_trajectory.png"
+    fit_score = write_final_aligned_render(
+        poses=corrected_poses,
+        reference_path=args.reference,
+        output_path=output_path,
+        background_opacity=args.background_opacity,
+    )
+    print(f"estimated {len(poses)} poses for first {limit} scans")
+    print(f"accepted {len(closures)} loop closures")
+    print(f"alignment fit score: {fit_score:.2f}")
+    print(f"wrote {output_path}")
+
+
+def add_odometry_constraint_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--heading-weight",
+        type=float,
+        default=0.15,
+        help="penalty weight for scan-structure heading disagreement",
+    )
+    command.add_argument(
+        "--heading-min-confidence",
+        type=float,
+        default=0.10,
+        help="minimum dominant-structure confidence used for heading constraints",
+    )
+    command.add_argument(
+        "--max-step-m",
+        type=float,
+        default=1.0,
+        help="maximum extrapolated keyframe translation before local search",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2327,7 +2728,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--max-points",
             type=int,
-            default=120,
+            default=80,
             help="maximum scan points used by the matcher",
         )
         command.add_argument(
@@ -2345,7 +2746,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--cell-size-m",
             type=float,
-            default=0.25,
+            default=0.15,
             help="submap occupancy grid cell size in meters",
         )
         command.add_argument(
@@ -2357,7 +2758,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--submap-keyframes",
             type=int,
-            default=8,
+            default=12,
             help="number of recent keyframes in the local submap",
         )
         command.add_argument(
@@ -2369,7 +2770,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-step-m",
             type=float,
-            default=0.4,
+            default=0.2,
             help="translation search step in meters",
         )
         command.add_argument(
@@ -2381,9 +2782,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-theta-step-deg",
             type=float,
-            default=4.0,
+            default=2.0,
             help="heading search step in degrees",
         )
+        add_odometry_constraint_arguments(command)
         command.set_defaults(func=run_stage6)
 
     for command_name in ("stage7", "debug-match"):
@@ -2428,7 +2830,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--max-points",
             type=int,
-            default=120,
+            default=80,
             help="maximum scan points used by the matcher",
         )
         command.add_argument(
@@ -2446,7 +2848,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--cell-size-m",
             type=float,
-            default=0.25,
+            default=0.15,
             help="submap occupancy grid cell size in meters",
         )
         command.add_argument(
@@ -2458,7 +2860,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--submap-keyframes",
             type=int,
-            default=8,
+            default=12,
             help="number of recent keyframes in the local submap",
         )
         command.add_argument(
@@ -2470,7 +2872,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-step-m",
             type=float,
-            default=0.4,
+            default=0.2,
             help="translation search step in meters",
         )
         command.add_argument(
@@ -2482,9 +2884,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-theta-step-deg",
             type=float,
-            default=4.0,
+            default=2.0,
             help="heading search step in degrees",
         )
+        add_odometry_constraint_arguments(command)
         command.set_defaults(func=run_stage7)
 
     for command_name in ("stage8", "heading-plot"):
@@ -2597,7 +3000,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--max-points",
             type=int,
-            default=120,
+            default=80,
             help="maximum scan points used by the matcher",
         )
         command.add_argument(
@@ -2615,7 +3018,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--cell-size-m",
             type=float,
-            default=0.25,
+            default=0.15,
             help="submap occupancy grid cell size in meters",
         )
         command.add_argument(
@@ -2627,7 +3030,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--submap-keyframes",
             type=int,
-            default=8,
+            default=12,
             help="number of recent keyframes in the local submap",
         )
         command.add_argument(
@@ -2639,7 +3042,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-step-m",
             type=float,
-            default=0.4,
+            default=0.2,
             help="translation search step in meters",
         )
         command.add_argument(
@@ -2651,9 +3054,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-theta-step-deg",
             type=float,
-            default=4.0,
+            default=2.0,
             help="heading search step in degrees",
         )
+        add_odometry_constraint_arguments(command)
         command.set_defaults(func=run_stage9)
 
     for command_name in ("stage10", "loop-closure"):
@@ -2693,7 +3097,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--max-points",
             type=int,
-            default=120,
+            default=80,
             help="maximum scan points used by the matcher",
         )
         command.add_argument(
@@ -2711,7 +3115,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--cell-size-m",
             type=float,
-            default=0.25,
+            default=0.15,
             help="submap occupancy grid cell size in meters",
         )
         command.add_argument(
@@ -2723,7 +3127,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--submap-keyframes",
             type=int,
-            default=8,
+            default=12,
             help="number of recent keyframes in the local submap",
         )
         command.add_argument(
@@ -2735,7 +3139,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-step-m",
             type=float,
-            default=0.4,
+            default=0.2,
             help="translation search step in meters",
         )
         command.add_argument(
@@ -2747,9 +3151,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--search-theta-step-deg",
             type=float,
-            default=4.0,
+            default=2.0,
             help="heading search step in degrees",
         )
+        add_odometry_constraint_arguments(command)
         command.add_argument(
             "--signature-bins",
             type=int,
@@ -2811,6 +3216,175 @@ def build_parser() -> argparse.ArgumentParser:
             help="weight anchoring the first pose",
         )
         command.set_defaults(func=run_stage10)
+
+    for command_name in ("stage11", "final"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 11 final aligned trajectory render",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--reference",
+            type=Path,
+            default=Path("challenge/Output_Trajectory.png"),
+            help="reference image used only for final similarity alignment",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--background-opacity",
+            type=float,
+            default=0.35,
+            help="opacity of the faded reference background",
+        )
+        command.add_argument(
+            "--limit",
+            type=int,
+            help="scan prefix limit; defaults to the full dataset",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="keyframe stride in scans",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--max-points",
+            type=int,
+            default=80,
+            help="maximum scan points used by the matcher",
+        )
+        command.add_argument(
+            "--min-range-m",
+            type=float,
+            default=0.7,
+            help="minimum point range used by the matcher",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum point range used by the matcher",
+        )
+        command.add_argument(
+            "--cell-size-m",
+            type=float,
+            default=0.15,
+            help="submap occupancy grid cell size in meters",
+        )
+        command.add_argument(
+            "--inflation-cells",
+            type=int,
+            default=1,
+            help="cell inflation radius for scan matching tolerance",
+        )
+        command.add_argument(
+            "--submap-keyframes",
+            type=int,
+            default=12,
+            help="number of recent keyframes in the local submap",
+        )
+        command.add_argument(
+            "--search-xy-m",
+            type=float,
+            default=0.8,
+            help="translation search radius around prediction in meters",
+        )
+        command.add_argument(
+            "--search-step-m",
+            type=float,
+            default=0.2,
+            help="translation search step in meters",
+        )
+        command.add_argument(
+            "--search-theta-deg",
+            type=float,
+            default=8.0,
+            help="heading search radius around prediction in degrees",
+        )
+        command.add_argument(
+            "--search-theta-step-deg",
+            type=float,
+            default=2.0,
+            help="heading search step in degrees",
+        )
+        add_odometry_constraint_arguments(command)
+        command.add_argument(
+            "--signature-bins",
+            type=int,
+            default=72,
+            help="range-signature bins used for loop candidate rejection",
+        )
+        command.add_argument(
+            "--signature-max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum range encoded in loop signatures",
+        )
+        command.add_argument(
+            "--min-loop-separation",
+            type=int,
+            default=80,
+            help="minimum keyframe ordinal separation for loop candidates",
+        )
+        command.add_argument(
+            "--max-loop-distance-m",
+            type=float,
+            default=5.0,
+            help="maximum raw-pose distance for loop candidates",
+        )
+        command.add_argument(
+            "--max-signature-distance",
+            type=float,
+            default=0.10,
+            help="maximum scan-signature distance for accepted loops",
+        )
+        command.add_argument(
+            "--min-overlap-bins",
+            type=int,
+            default=10,
+            help="minimum overlapping signature bins for loop comparison",
+        )
+        command.add_argument(
+            "--max-closures",
+            type=int,
+            default=40,
+            help="maximum accepted loop closures",
+        )
+        command.add_argument(
+            "--loop-weight",
+            type=float,
+            default=0.35,
+            help="weight for loop-closure constraints",
+        )
+        command.add_argument(
+            "--odometry-weight",
+            type=float,
+            default=1.0,
+            help="weight for adjacent odometry constraints",
+        )
+        command.add_argument(
+            "--anchor-weight",
+            type=float,
+            default=100.0,
+            help="weight anchoring the first pose",
+        )
+        command.set_defaults(func=run_stage11)
 
     return parser
 
