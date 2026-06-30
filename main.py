@@ -522,6 +522,120 @@ def default_scan_indices(start: int, stride: int, count: int) -> list[int]:
     return [start + stride * offset for offset in range(count)]
 
 
+def parse_windows(raw_windows: str) -> list[tuple[int, int]]:
+    windows = []
+    for raw_window in raw_windows.split(","):
+        if not raw_window.strip():
+            continue
+
+        start_text, stop_text = raw_window.split(":", maxsplit=1)
+        windows.append((int(start_text), int(stop_text)))
+    return windows
+
+
+def default_overlay_windows() -> list[tuple[int, int]]:
+    return [(0, 10), (5000, 5010)]
+
+
+def write_scan_overlay_plot(
+    scans: list[LocalScan],
+    output_path: Path,
+    max_range_m: float,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 4 PNGs") from exc
+
+    width = 1000
+    height = 900
+    left = 68
+    right = 150
+    top = 54
+    bottom = 58
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    center_x = left + plot_width / 2.0
+    center_y = top + plot_height / 2.0
+    scale = min(plot_width, plot_height) / (2.0 * max_range_m)
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    grid_color = (224, 224, 224)
+    axis_color = (70, 70, 70)
+    origin_color = (220, 38, 38)
+    colors = [
+        (68, 1, 84),
+        (72, 35, 116),
+        (64, 67, 135),
+        (52, 94, 141),
+        (41, 120, 142),
+        (32, 144, 140),
+        (34, 167, 132),
+        (68, 190, 112),
+        (121, 209, 81),
+        (189, 223, 38),
+    ]
+
+    draw.rectangle((left, top, width - right, height - bottom), outline=axis_color)
+    grid_extent_m = int(max_range_m // 5) * 5
+    for value_m in range(-grid_extent_m, grid_extent_m + 1, 5):
+        x = center_x + value_m * scale
+        y = center_y - value_m * scale
+        draw.line([(x, top), (x, height - bottom)], fill=grid_color)
+        draw.line([(left, y), (width - right, y)], fill=grid_color)
+        if value_m != 0:
+            draw.text((x - 8, height - bottom + 12), str(value_m), fill=axis_color)
+            draw.text((12, y - 7), str(value_m), fill=axis_color)
+
+    draw.line([(center_x, top), (center_x, height - bottom)], fill=axis_color)
+    draw.line([(left, center_y), (width - right, center_y)], fill=axis_color)
+
+    for range_m in range(5, grid_extent_m + 1, 5):
+        radius = range_m * scale
+        draw.ellipse(
+            (
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+            ),
+            outline=(238, 238, 238),
+        )
+
+    for scan_offset, scan in enumerate(scans):
+        color = colors[scan_offset % len(colors)]
+        for x_m, y_m, _intensity in scan.points:
+            x = round(center_x + x_m * scale)
+            y = round(center_y - y_m * scale)
+            if left <= x <= width - right and top <= y <= height - bottom:
+                draw.point((x, y), fill=color)
+
+    draw.line([(center_x - 7, center_y), (center_x + 7, center_y)], fill=origin_color)
+    draw.line([(center_x, center_y - 7), (center_x, center_y + 7)], fill=origin_color)
+
+    first_scan = scans[0].scan_index if scans else 0
+    last_scan = scans[-1].scan_index if scans else 0
+    draw.text(
+        (left, 16),
+        f"local overlay: scans {first_scan:05d} to {last_scan:05d}",
+        fill=axis_color,
+    )
+    draw.text((width // 2 - 45, height - 26), "x meters", fill=axis_color)
+    draw.text((10, top - 24), "y meters", fill=axis_color)
+
+    legend_x = width - right + 22
+    legend_y = top + 8
+    for scan_offset, scan in enumerate(scans):
+        y = legend_y + scan_offset * 20
+        color = colors[scan_offset % len(colors)]
+        draw.rectangle((legend_x, y, legend_x + 12, y + 12), fill=color)
+        draw.text((legend_x + 18, y - 1), f"{scan.scan_index:05d}", fill=axis_color)
+
+    image.save(output_path)
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -547,6 +661,23 @@ def run_stage3(args: argparse.Namespace) -> None:
         max_range_m=args.max_range_m,
     )
     print(f"wrote {output_path}")
+
+
+def run_stage4(args: argparse.Namespace) -> None:
+    windows = parse_windows(args.windows) if args.windows else default_overlay_windows()
+    for start, stop in windows:
+        if stop <= start:
+            raise ValueError(f"overlay window stop must be greater than start: {start}:{stop}")
+
+        indices = range(start, stop)
+        scans = list(iter_local_scans(args.lidar, indices))
+        if not scans:
+            raise ValueError(f"no scans found for overlay window {start}:{stop}")
+
+        output_path = args.out_dir / f"03_overlay_{start:04d}_{stop:04d}.png"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        write_scan_overlay_plot(scans, output_path, args.max_range_m)
+        print(f"wrote {output_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -657,6 +788,35 @@ def build_parser() -> argparse.ArgumentParser:
             help="maximum distance shown in meters",
         )
         command.set_defaults(func=run_stage3)
+
+    for command_name in ("stage4", "overlay-scans"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 4 consecutive-scan overlays",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--windows",
+            help="comma-separated half-open scan windows, for example 0:10,5000:5010",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=16.0,
+            help="fixed plot radius in meters",
+        )
+        command.set_defaults(func=run_stage4)
 
     return parser
 
