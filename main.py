@@ -636,6 +636,166 @@ def write_scan_overlay_plot(
     image.save(output_path)
 
 
+def select_keyframes(
+    lidar_path: Path,
+    stride: int,
+    min_valid_points: int,
+) -> tuple[list[int], list[int]]:
+    keyframe_indices = []
+    valid_counts = []
+    for scan_index, summary in enumerate(iter_scan_summaries(lidar_path)):
+        valid_counts.append(summary.valid_point_count)
+        if scan_index % stride == 0 and summary.valid_point_count >= min_valid_points:
+            keyframe_indices.append(scan_index)
+
+    return keyframe_indices, valid_counts
+
+
+def sample_evenly(values: list[int], count: int) -> list[int]:
+    if count <= 0:
+        return []
+    if len(values) <= count:
+        return values
+
+    return [
+        values[round(offset * (len(values) - 1) / (count - 1))]
+        for offset in range(count)
+    ]
+
+
+def draw_scan_thumbnail(
+    draw: object,
+    scan: LocalScan,
+    bounds: tuple[int, int, int, int],
+    max_range_m: float,
+) -> None:
+    left, top, right, bottom = bounds
+    center_x = (left + right) / 2.0
+    center_y = (top + bottom) / 2.0
+    scale = min(right - left, bottom - top) / (2.0 * max_range_m)
+
+    grid_color = (230, 230, 230)
+    axis_color = (80, 80, 80)
+    point_color = (109, 40, 217)
+    origin_color = (220, 38, 38)
+
+    draw.rectangle((left, top, right, bottom), outline=axis_color)
+    draw.line([(center_x, top), (center_x, bottom)], fill=grid_color)
+    draw.line([(left, center_y), (right, center_y)], fill=grid_color)
+
+    for x_m, y_m, _intensity in scan.points:
+        x = round(center_x + x_m * scale)
+        y = round(center_y - y_m * scale)
+        if left <= x <= right and top <= y <= bottom:
+            draw.point((x, y), fill=point_color)
+
+    draw.line([(center_x - 4, center_y), (center_x + 4, center_y)], fill=origin_color)
+    draw.line([(center_x, center_y - 4), (center_x, center_y + 4)], fill=origin_color)
+    draw.text((left + 6, top + 6), f"{scan.scan_index:05d}", fill=axis_color)
+
+
+def write_keyframe_preview(
+    valid_counts: list[int],
+    keyframe_indices: list[int],
+    sample_scans: list[LocalScan],
+    output_path: Path,
+    stride: int,
+    min_valid_points: int,
+    max_range_m: float,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 5 PNG") from exc
+
+    width = 1600
+    height = 980
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    left = 72
+    right = 28
+    top = 72
+    plot_height = 300
+    plot_width = width - left - right
+    plot_bottom = top + plot_height
+    max_count = max(valid_counts) if valid_counts else 1
+
+    grid_color = (224, 224, 224)
+    axis_color = (64, 64, 64)
+    count_color = (110, 110, 110)
+    keyframe_color = (109, 40, 217)
+    skipped_color = (220, 38, 38)
+
+    draw.text((left, 18), "Stage 5 keyframe selection preview", fill=axis_color)
+    draw.text(
+        (left, 42),
+        (
+            f"{len(keyframe_indices)} keyframes from {len(valid_counts)} scans | "
+            f"stride {stride} | min valid points {min_valid_points}"
+        ),
+        fill=axis_color,
+    )
+
+    for step in range(6):
+        y = top + round(plot_height * step / 5)
+        draw.line([(left, y), (width - right, y)], fill=grid_color)
+        label = round(max_count * (5 - step) / 5)
+        draw.text((8, y - 7), str(label), fill=axis_color)
+
+    for step in range(6):
+        x = left + round(plot_width * step / 5)
+        label = round((len(valid_counts) - 1) * step / 5) if valid_counts else 0
+        draw.line([(x, top), (x, plot_bottom)], fill=grid_color)
+        draw.text((x - 20, plot_bottom + 12), str(label), fill=axis_color)
+
+    draw.rectangle((left, top, width - right, plot_bottom), outline=axis_color)
+    draw.text((8, top - 24), "valid pts", fill=axis_color)
+    draw.text((width // 2 - 38, plot_bottom + 34), "scan index", fill=axis_color)
+
+    if valid_counts:
+        for pixel_x in range(plot_width):
+            start = pixel_x * len(valid_counts) // plot_width
+            end = max(start + 1, (pixel_x + 1) * len(valid_counts) // plot_width)
+            bucket = valid_counts[start:end]
+            bucket_min = min(bucket)
+            bucket_max = max(bucket)
+            x = left + pixel_x
+            y_min = plot_bottom - round(bucket_min / max_count * plot_height)
+            y_max = plot_bottom - round(bucket_max / max_count * plot_height)
+            color = skipped_color if bucket_min < min_valid_points else count_color
+            draw.line([(x, y_max), (x, y_min)], fill=color)
+
+    for keyframe_index in keyframe_indices:
+        x = left + round(keyframe_index / max(len(valid_counts) - 1, 1) * plot_width)
+        draw.line([(x, plot_bottom - 34), (x, plot_bottom)], fill=keyframe_color)
+
+    sample_top = 470
+    sample_left = 72
+    columns = 5
+    rows = 2
+    gap = 18
+    cell_width = (width - sample_left - right - gap * (columns - 1)) // columns
+    cell_height = 205
+    draw.text((sample_left, sample_top - 34), "Sample selected keyframes", fill=axis_color)
+
+    for sample_offset, scan in enumerate(sample_scans[: columns * rows]):
+        row = sample_offset // columns
+        column = sample_offset % columns
+        cell_left = sample_left + column * (cell_width + gap)
+        cell_top = sample_top + row * (cell_height + 44)
+        bounds = (
+            cell_left,
+            cell_top,
+            cell_left + cell_width,
+            cell_top + cell_height,
+        )
+        draw_scan_thumbnail(draw, scan, bounds, max_range_m)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -678,6 +838,36 @@ def run_stage4(args: argparse.Namespace) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         write_scan_overlay_plot(scans, output_path, args.max_range_m)
         print(f"wrote {output_path}")
+
+
+def run_stage5(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.sample_count <= 0:
+        raise ValueError("--sample-count must be greater than 0")
+
+    keyframe_indices, valid_counts = select_keyframes(
+        lidar_path=args.lidar,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+    )
+    if not keyframe_indices:
+        raise ValueError("no keyframes selected; lower --min-valid-points or --stride")
+
+    sample_indices = sample_evenly(keyframe_indices, args.sample_count)
+    sample_scans = list(iter_local_scans(args.lidar, sample_indices))
+    output_path = args.out_dir / "04_keyframe_samples.png"
+    write_keyframe_preview(
+        valid_counts=valid_counts,
+        keyframe_indices=keyframe_indices,
+        sample_scans=sample_scans,
+        output_path=output_path,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+        max_range_m=args.max_range_m,
+    )
+    print(f"selected {len(keyframe_indices)} keyframes")
+    print(f"wrote {output_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -817,6 +1007,49 @@ def build_parser() -> argparse.ArgumentParser:
             help="fixed plot radius in meters",
         )
         command.set_defaults(func=run_stage4)
+
+    for command_name in ("stage5", "keyframes"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 5 keyframe selection preview",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="select one keyframe every N scans",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--sample-count",
+            type=int,
+            default=10,
+            help="number of selected keyframes to draw as local scan samples",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=16.0,
+            help="fixed sample plot radius in meters",
+        )
+        command.set_defaults(func=run_stage5)
 
     return parser
 
