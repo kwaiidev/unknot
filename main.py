@@ -29,6 +29,15 @@ class LocalScan:
     points: list[tuple[float, float, int]]
 
 
+@dataclass(frozen=True)
+class Pose2D:
+    scan_index: int
+    x_m: float
+    y_m: float
+    theta_rad: float
+    score: float
+
+
 def iter_scan_summaries(lidar_path: Path) -> Iterable[ScanSummary]:
     with lidar_path.open("r", encoding="utf-8") as scan_file:
         for line_number, line in enumerate(scan_file, start=1):
@@ -522,6 +531,14 @@ def default_scan_indices(start: int, stride: int, count: int) -> list[int]:
     return [start + stride * offset for offset in range(count)]
 
 
+def parse_ints(raw_values: str) -> list[int]:
+    return [
+        int(raw_value.strip())
+        for raw_value in raw_values.split(",")
+        if raw_value.strip()
+    ]
+
+
 def parse_windows(raw_windows: str) -> list[tuple[int, int]]:
     windows = []
     for raw_window in raw_windows.split(","):
@@ -654,6 +671,8 @@ def select_keyframes(
 def sample_evenly(values: list[int], count: int) -> list[int]:
     if count <= 0:
         return []
+    if count == 1:
+        return values[:1]
     if len(values) <= count:
         return values
 
@@ -796,6 +815,328 @@ def write_keyframe_preview(
     image.save(output_path)
 
 
+def thin_scan_points(
+    points: list[tuple[float, float, int]],
+    max_points: int,
+    min_range_m: float,
+    max_range_m: float,
+) -> list[tuple[float, float]]:
+    filtered = [
+        (x_m, y_m)
+        for x_m, y_m, _intensity in points
+        if min_range_m <= math.hypot(x_m, y_m) <= max_range_m
+    ]
+    if len(filtered) <= max_points:
+        return filtered
+
+    step = math.ceil(len(filtered) / max_points)
+    return filtered[::step]
+
+
+def transform_xy_points(
+    points: list[tuple[float, float]],
+    pose: Pose2D,
+) -> list[tuple[float, float]]:
+    cos_theta = math.cos(pose.theta_rad)
+    sin_theta = math.sin(pose.theta_rad)
+    return [
+        (
+            pose.x_m + cos_theta * x_m - sin_theta * y_m,
+            pose.y_m + sin_theta * x_m + cos_theta * y_m,
+        )
+        for x_m, y_m in points
+    ]
+
+
+def grid_cell(x_m: float, y_m: float, cell_size_m: float) -> tuple[int, int]:
+    return (
+        math.floor(x_m / cell_size_m),
+        math.floor(y_m / cell_size_m),
+    )
+
+
+def inflate_cells(
+    occupied_cells: set[tuple[int, int]],
+    radius_cells: int,
+) -> set[tuple[int, int]]:
+    inflated = set()
+    for cell_x, cell_y in occupied_cells:
+        for offset_x in range(-radius_cells, radius_cells + 1):
+            for offset_y in range(-radius_cells, radius_cells + 1):
+                inflated.add((cell_x + offset_x, cell_y + offset_y))
+    return inflated
+
+
+def build_submap_cells(
+    world_scans: list[list[tuple[float, float]]],
+    cell_size_m: float,
+    inflation_cells: int,
+    submap_keyframes: int,
+) -> set[tuple[int, int]]:
+    occupied = set()
+    for world_points in world_scans[-submap_keyframes:]:
+        for x_m, y_m in world_points:
+            occupied.add(grid_cell(x_m, y_m, cell_size_m))
+    return inflate_cells(occupied, inflation_cells)
+
+
+def score_pose(
+    points: list[tuple[float, float]],
+    pose: Pose2D,
+    submap_cells: set[tuple[int, int]],
+    cell_size_m: float,
+) -> float:
+    if not points or not submap_cells:
+        return 0.0
+
+    cos_theta = math.cos(pose.theta_rad)
+    sin_theta = math.sin(pose.theta_rad)
+    match_count = 0
+    for x_m, y_m in points:
+        world_x = pose.x_m + cos_theta * x_m - sin_theta * y_m
+        world_y = pose.y_m + sin_theta * x_m + cos_theta * y_m
+        if grid_cell(world_x, world_y, cell_size_m) in submap_cells:
+            match_count += 1
+
+    return match_count / len(points)
+
+
+def frange(start: float, stop: float, step: float) -> list[float]:
+    values = []
+    value = start
+    while value <= stop + step * 0.5:
+        values.append(value)
+        value += step
+    return values
+
+
+def estimate_odometry(
+    lidar_path: Path,
+    limit: int,
+    stride: int,
+    min_valid_points: int,
+    max_points: int,
+    min_range_m: float,
+    max_range_m: float,
+    cell_size_m: float,
+    inflation_cells: int,
+    submap_keyframes: int,
+    search_xy_m: float,
+    search_step_m: float,
+    search_theta_deg: float,
+    search_theta_step_deg: float,
+) -> list[Pose2D]:
+    keyframe_indices, valid_counts = select_keyframes(
+        lidar_path=lidar_path,
+        stride=stride,
+        min_valid_points=min_valid_points,
+    )
+    selected_indices = [
+        index
+        for index in keyframe_indices
+        if index < limit and valid_counts[index] >= min_valid_points
+    ]
+    scans = list(iter_local_scans(lidar_path, selected_indices))
+    if not scans:
+        return []
+
+    local_scans = [
+        thin_scan_points(
+            points=scan.points,
+            max_points=max_points,
+            min_range_m=min_range_m,
+            max_range_m=max_range_m,
+        )
+        for scan in scans
+    ]
+
+    poses = [Pose2D(scans[0].scan_index, 0.0, 0.0, 0.0, 1.0)]
+    world_scans = [transform_xy_points(local_scans[0], poses[0])]
+
+    xy_offsets = frange(-search_xy_m, search_xy_m, search_step_m)
+    theta_offsets = [
+        math.radians(value)
+        for value in frange(-search_theta_deg, search_theta_deg, search_theta_step_deg)
+    ]
+
+    for scan, local_points in zip(scans[1:], local_scans[1:]):
+        previous_pose = poses[-1]
+        if len(poses) >= 2:
+            previous_previous_pose = poses[-2]
+            delta_x = previous_pose.x_m - previous_previous_pose.x_m
+            delta_y = previous_pose.y_m - previous_previous_pose.y_m
+            delta_theta = previous_pose.theta_rad - previous_previous_pose.theta_rad
+        else:
+            delta_x = 0.0
+            delta_y = 0.0
+            delta_theta = 0.0
+
+        predicted_pose = Pose2D(
+            scan_index=scan.scan_index,
+            x_m=previous_pose.x_m + delta_x,
+            y_m=previous_pose.y_m + delta_y,
+            theta_rad=previous_pose.theta_rad + delta_theta,
+            score=0.0,
+        )
+        submap_cells = build_submap_cells(
+            world_scans=world_scans,
+            cell_size_m=cell_size_m,
+            inflation_cells=inflation_cells,
+            submap_keyframes=submap_keyframes,
+        )
+
+        best_pose = predicted_pose
+        best_score = -1.0
+        for offset_theta in theta_offsets:
+            theta = predicted_pose.theta_rad + offset_theta
+            for offset_x in xy_offsets:
+                for offset_y in xy_offsets:
+                    candidate = Pose2D(
+                        scan_index=scan.scan_index,
+                        x_m=predicted_pose.x_m + offset_x,
+                        y_m=predicted_pose.y_m + offset_y,
+                        theta_rad=theta,
+                        score=0.0,
+                    )
+                    score = score_pose(
+                        points=local_points,
+                        pose=candidate,
+                        submap_cells=submap_cells,
+                        cell_size_m=cell_size_m,
+                    )
+                    movement_penalty = (
+                        abs(offset_x) + abs(offset_y) + abs(offset_theta) * 2.0
+                    ) * 0.01
+                    adjusted_score = score - movement_penalty
+                    if adjusted_score > best_score:
+                        best_score = adjusted_score
+                        best_pose = Pose2D(
+                            scan_index=scan.scan_index,
+                            x_m=candidate.x_m,
+                            y_m=candidate.y_m,
+                            theta_rad=candidate.theta_rad,
+                            score=score,
+                        )
+
+        poses.append(best_pose)
+        world_scans.append(transform_xy_points(local_points, best_pose))
+
+    return poses
+
+
+def write_odometry_preview(
+    poses: list[Pose2D],
+    output_path: Path,
+    limit: int,
+    stride: int,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 6 PNGs") from exc
+
+    width = 1100
+    height = 900
+    left = 74
+    right = 220
+    top = 64
+    bottom = 72
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    axis_color = (64, 64, 64)
+    grid_color = (225, 225, 225)
+    path_color = (109, 40, 217)
+    start_color = (34, 197, 94)
+    end_color = (220, 38, 38)
+
+    if poses:
+        min_x = min(pose.x_m for pose in poses)
+        max_x = max(pose.x_m for pose in poses)
+        min_y = min(pose.y_m for pose in poses)
+        max_y = max(pose.y_m for pose in poses)
+    else:
+        min_x = min_y = -1.0
+        max_x = max_y = 1.0
+
+    span_x = max(max_x - min_x, 1.0)
+    span_y = max(max_y - min_y, 1.0)
+    padding = max(span_x, span_y) * 0.08
+    min_x -= padding
+    max_x += padding
+    min_y -= padding
+    max_y += padding
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    scale = min(plot_width / span_x, plot_height / span_y)
+
+    def project(x_m: float, y_m: float) -> tuple[float, float]:
+        x = left + (x_m - min_x) * scale
+        y = top + plot_height - (y_m - min_y) * scale
+        return x, y
+
+    for step in range(6):
+        x = left + round(plot_width * step / 5)
+        y = top + round(plot_height * step / 5)
+        draw.line([(x, top), (x, top + plot_height)], fill=grid_color)
+        draw.line([(left, y), (left + plot_width, y)], fill=grid_color)
+
+    draw.rectangle((left, top, left + plot_width, top + plot_height), outline=axis_color)
+    draw.text((left, 18), f"Stage 6 odometry preview: first {limit} scans", fill=axis_color)
+    draw.text(
+        (left, 40),
+        f"{len(poses)} keyframe poses | stride {stride} | local scan-to-submap search",
+        fill=axis_color,
+    )
+
+    if len(poses) >= 2:
+        path = [project(pose.x_m, pose.y_m) for pose in poses]
+        draw.line(path, fill=path_color, width=3)
+        for pose in poses[:: max(len(poses) // 20, 1)]:
+            x, y = project(pose.x_m, pose.y_m)
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=path_color)
+
+    if poses:
+        start_x, start_y = project(poses[0].x_m, poses[0].y_m)
+        end_x, end_y = project(poses[-1].x_m, poses[-1].y_m)
+        draw.ellipse((start_x - 6, start_y - 6, start_x + 6, start_y + 6), fill=start_color)
+        draw.ellipse((end_x - 6, end_y - 6, end_x + 6, end_y + 6), fill=end_color)
+
+    legend_x = left + plot_width + 34
+    legend_y = top + 10
+    draw.line([(legend_x, legend_y), (legend_x + 42, legend_y)], fill=path_color, width=3)
+    draw.text((legend_x + 52, legend_y - 7), "estimated path", fill=axis_color)
+    draw.ellipse(
+        (legend_x, legend_y + 28, legend_x + 12, legend_y + 40),
+        fill=start_color,
+    )
+    draw.text((legend_x + 22, legend_y + 26), "start", fill=axis_color)
+    draw.ellipse(
+        (legend_x, legend_y + 56, legend_x + 12, legend_y + 68),
+        fill=end_color,
+    )
+    draw.text((legend_x + 22, legend_y + 54), "end", fill=axis_color)
+
+    scores = [pose.score for pose in poses[1:]]
+    if scores:
+        draw.text(
+            (legend_x, legend_y + 96),
+            f"score median {statistics.median(scores):.2f}",
+            fill=axis_color,
+        )
+        draw.text(
+            (legend_x, legend_y + 118),
+            f"score min {min(scores):.2f}",
+            fill=axis_color,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -868,6 +1209,45 @@ def run_stage5(args: argparse.Namespace) -> None:
     )
     print(f"selected {len(keyframe_indices)} keyframes")
     print(f"wrote {output_path}")
+
+
+def run_stage6(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.max_points <= 0:
+        raise ValueError("--max-points must be greater than 0")
+    if args.search_step_m <= 0.0:
+        raise ValueError("--search-step-m must be greater than 0")
+    if args.search_theta_step_deg <= 0.0:
+        raise ValueError("--search-theta-step-deg must be greater than 0")
+
+    limits = parse_ints(args.limits)
+    for limit in limits:
+        poses = estimate_odometry(
+            lidar_path=args.lidar,
+            limit=limit,
+            stride=args.stride,
+            min_valid_points=args.min_valid_points,
+            max_points=args.max_points,
+            min_range_m=args.min_range_m,
+            max_range_m=args.max_range_m,
+            cell_size_m=args.cell_size_m,
+            inflation_cells=args.inflation_cells,
+            submap_keyframes=args.submap_keyframes,
+            search_xy_m=args.search_xy_m,
+            search_step_m=args.search_step_m,
+            search_theta_deg=args.search_theta_deg,
+            search_theta_step_deg=args.search_theta_step_deg,
+        )
+        output_path = args.out_dir / f"05_odom_first_{limit}.png"
+        write_odometry_preview(
+            poses=poses,
+            output_path=output_path,
+            limit=limit,
+            stride=args.stride,
+        )
+        print(f"estimated {len(poses)} poses for first {limit} scans")
+        print(f"wrote {output_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1050,6 +1430,102 @@ def build_parser() -> argparse.ArgumentParser:
             help="fixed sample plot radius in meters",
         )
         command.set_defaults(func=run_stage5)
+
+    for command_name in ("stage6", "odom-preview"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 6 first odometry previews",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--limits",
+            default="1000,3000",
+            help="comma-separated scan prefixes to render",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="keyframe stride in scans",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--max-points",
+            type=int,
+            default=120,
+            help="maximum scan points used by the matcher",
+        )
+        command.add_argument(
+            "--min-range-m",
+            type=float,
+            default=0.7,
+            help="minimum point range used by the matcher",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum point range used by the matcher",
+        )
+        command.add_argument(
+            "--cell-size-m",
+            type=float,
+            default=0.25,
+            help="submap occupancy grid cell size in meters",
+        )
+        command.add_argument(
+            "--inflation-cells",
+            type=int,
+            default=1,
+            help="cell inflation radius for scan matching tolerance",
+        )
+        command.add_argument(
+            "--submap-keyframes",
+            type=int,
+            default=8,
+            help="number of recent keyframes in the local submap",
+        )
+        command.add_argument(
+            "--search-xy-m",
+            type=float,
+            default=0.8,
+            help="translation search radius around prediction in meters",
+        )
+        command.add_argument(
+            "--search-step-m",
+            type=float,
+            default=0.4,
+            help="translation search step in meters",
+        )
+        command.add_argument(
+            "--search-theta-deg",
+            type=float,
+            default=8.0,
+            help="heading search radius around prediction in degrees",
+        )
+        command.add_argument(
+            "--search-theta-step-deg",
+            type=float,
+            default=4.0,
+            help="heading search step in degrees",
+        )
+        command.set_defaults(func=run_stage6)
 
     return parser
 
