@@ -47,6 +47,15 @@ class MatchDebug:
     current_points: list[tuple[float, float]]
 
 
+@dataclass(frozen=True)
+class HeadingSample:
+    scan_index: int
+    angle_deg: float | None
+    smoothed_deg: float | None
+    confidence: float
+    valid_points: int
+
+
 def iter_scan_summaries(lidar_path: Path) -> Iterable[ScanSummary]:
     with lidar_path.open("r", encoding="utf-8") as scan_file:
         for line_number, line in enumerate(scan_file, start=1):
@@ -1330,6 +1339,263 @@ def write_match_debug_plot(
     image.save(output_path)
 
 
+def dominant_structure_angle(
+    points: list[tuple[float, float, int]],
+    bin_count: int,
+    min_segment_m: float,
+    max_segment_m: float,
+    min_range_m: float,
+    max_range_m: float,
+) -> tuple[float | None, float]:
+    bins = [0.0] * bin_count
+    previous_point = None
+    valid_points = [
+        (x_m, y_m)
+        for x_m, y_m, _intensity in points
+        if min_range_m <= math.hypot(x_m, y_m) <= max_range_m
+    ]
+
+    for point in valid_points:
+        if previous_point is not None:
+            dx = point[0] - previous_point[0]
+            dy = point[1] - previous_point[1]
+            segment_length = math.hypot(dx, dy)
+            if min_segment_m <= segment_length <= max_segment_m:
+                angle_rad = math.atan2(dy, dx) % math.pi
+                bin_index = min(int(angle_rad / math.pi * bin_count), bin_count - 1)
+                bins[bin_index] += segment_length
+        previous_point = point
+
+    total_weight = sum(bins)
+    if total_weight <= 0.0:
+        return None, 0.0
+
+    best_index = max(range(bin_count), key=lambda index: bins[index])
+    confidence = bins[best_index] / total_weight
+    angle_rad = (best_index + 0.5) / bin_count * math.pi
+    return angle_rad, confidence
+
+
+def median_or_none(values: list[float | None]) -> float | None:
+    present_values = [value for value in values if value is not None]
+    if not present_values:
+        return None
+    return statistics.median(present_values)
+
+
+def compute_heading_samples(
+    lidar_path: Path,
+    stride: int,
+    min_valid_points: int,
+    bin_count: int,
+    smoothing_window: int,
+    min_segment_m: float,
+    max_segment_m: float,
+    min_range_m: float,
+    max_range_m: float,
+) -> list[HeadingSample]:
+    keyframe_indices, valid_counts = select_keyframes(
+        lidar_path=lidar_path,
+        stride=stride,
+        min_valid_points=min_valid_points,
+    )
+    scans = list(iter_local_scans(lidar_path, keyframe_indices))
+
+    angle_values = []
+    confidences = []
+    for scan in scans:
+        angle_rad, confidence = dominant_structure_angle(
+            points=scan.points,
+            bin_count=bin_count,
+            min_segment_m=min_segment_m,
+            max_segment_m=max_segment_m,
+            min_range_m=min_range_m,
+            max_range_m=max_range_m,
+        )
+        if angle_rad is None:
+            angle_values.append(None)
+            confidences.append(confidence)
+            continue
+
+        angle_deg = (math.degrees(angle_rad) + 90.0) % 180.0 - 90.0
+        angle_values.append(angle_deg)
+        confidences.append(confidence)
+
+    half_window = max(smoothing_window // 2, 0)
+    smoothed_angles = []
+    for index in range(len(angle_values)):
+        start = max(0, index - half_window)
+        stop = min(len(angle_values), index + half_window + 1)
+        smoothed_angles.append(median_or_none(angle_values[start:stop]))
+
+    return [
+        HeadingSample(
+            scan_index=scan.scan_index,
+            angle_deg=angle_deg,
+            smoothed_deg=smoothed_deg,
+            confidence=confidence,
+            valid_points=valid_counts[scan.scan_index],
+        )
+        for scan, angle_deg, smoothed_deg, confidence in zip(
+            scans,
+            angle_values,
+            smoothed_angles,
+            confidences,
+        )
+    ]
+
+
+def write_heading_plot(
+    samples: list[HeadingSample],
+    output_path: Path,
+    stride: int,
+    turn_threshold_deg: float,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to write the Stage 8 PNG") from exc
+
+    width = 1600
+    height = 820
+    left = 82
+    right = 220
+    top = 70
+    bottom = 72
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+
+    axis_color = (64, 64, 64)
+    grid_color = (225, 225, 225)
+    raw_color = (190, 190, 190)
+    smooth_color = (109, 40, 217)
+    turn_color = (220, 38, 38)
+    confidence_color = (22, 163, 74)
+
+    present_angles = [sample.smoothed_deg for sample in samples if sample.smoothed_deg is not None]
+    if present_angles:
+        min_angle = min(present_angles)
+        max_angle = max(present_angles)
+    else:
+        min_angle = -90.0
+        max_angle = 90.0
+
+    angle_padding = max((max_angle - min_angle) * 0.08, 10.0)
+    min_angle -= angle_padding
+    max_angle += angle_padding
+    angle_span = max(max_angle - min_angle, 1.0)
+    max_scan_index = samples[-1].scan_index if samples else 1
+
+    def project(scan_index: int, angle_deg: float) -> tuple[float, float]:
+        x = left + scan_index / max(max_scan_index, 1) * plot_width
+        y = top + plot_height - (angle_deg - min_angle) / angle_span * plot_height
+        return x, y
+
+    for step in range(6):
+        x = left + round(plot_width * step / 5)
+        y = top + round(plot_height * step / 5)
+        draw.line([(x, top), (x, top + plot_height)], fill=grid_color)
+        draw.line([(left, y), (left + plot_width, y)], fill=grid_color)
+
+        scan_label = round(max_scan_index * step / 5)
+        angle_label = max_angle - angle_span * step / 5
+        draw.text((x - 22, top + plot_height + 12), str(scan_label), fill=axis_color)
+        draw.text((10, y - 7), f"{angle_label:.0f}", fill=axis_color)
+
+    draw.rectangle((left, top, left + plot_width, top + plot_height), outline=axis_color)
+    draw.text((left, 18), "Stage 8 heading and structure plot", fill=axis_color)
+    draw.text(
+        (left, 42),
+        (
+            f"{len(samples)} sampled scans | stride {stride} | "
+            "dominant local line angle"
+        ),
+        fill=axis_color,
+    )
+    draw.text((10, top - 24), "angle deg", fill=axis_color)
+    draw.text((left + plot_width // 2 - 38, top + plot_height + 36), "scan index", fill=axis_color)
+
+    raw_points = [
+        project(sample.scan_index, sample.angle_deg)
+        for sample in samples
+        if sample.angle_deg is not None
+    ]
+    if len(raw_points) >= 2:
+        draw.line(raw_points, fill=raw_color, width=1)
+
+    smooth_points = [
+        project(sample.scan_index, sample.smoothed_deg)
+        for sample in samples
+        if sample.smoothed_deg is not None
+    ]
+    if len(smooth_points) >= 2:
+        draw.line(smooth_points, fill=smooth_color, width=3)
+
+    turn_count = 0
+    previous_sample = None
+    for sample in samples:
+        if (
+            previous_sample is not None
+            and sample.smoothed_deg is not None
+            and previous_sample.smoothed_deg is not None
+        ):
+            delta = abs(sample.smoothed_deg - previous_sample.smoothed_deg)
+            if delta >= turn_threshold_deg:
+                x, _y = project(sample.scan_index, sample.smoothed_deg)
+                draw.line([(x, top), (x, top + plot_height)], fill=turn_color)
+                turn_count += 1
+        if sample.smoothed_deg is not None:
+            previous_sample = sample
+
+    confidence_top = top + plot_height - 100
+    confidence_points = [
+        (
+            left + sample.scan_index / max(max_scan_index, 1) * plot_width,
+            confidence_top - sample.confidence * 80,
+        )
+        for sample in samples
+    ]
+    if len(confidence_points) >= 2:
+        draw.line(confidence_points, fill=confidence_color, width=2)
+
+    legend_x = left + plot_width + 34
+    legend_y = top + 10
+    draw.line([(legend_x, legend_y), (legend_x + 42, legend_y)], fill=smooth_color, width=3)
+    draw.text((legend_x + 52, legend_y - 7), "smoothed angle", fill=axis_color)
+    draw.line(
+        [(legend_x, legend_y + 30), (legend_x + 42, legend_y + 30)],
+        fill=raw_color,
+        width=1,
+    )
+    draw.text((legend_x + 52, legend_y + 23), "raw angle", fill=axis_color)
+    draw.line(
+        [(legend_x, legend_y + 60), (legend_x + 42, legend_y + 60)],
+        fill=confidence_color,
+        width=2,
+    )
+    draw.text((legend_x + 52, legend_y + 53), "confidence", fill=axis_color)
+    draw.line(
+        [(legend_x, legend_y + 90), (legend_x + 42, legend_y + 90)],
+        fill=turn_color,
+        width=2,
+    )
+    draw.text((legend_x + 52, legend_y + 83), "turn marker", fill=axis_color)
+    draw.text((legend_x, legend_y + 126), f"turn markers {turn_count}", fill=axis_color)
+    if samples:
+        confidence_values = [sample.confidence for sample in samples]
+        draw.text(
+            (legend_x, legend_y + 148),
+            f"confidence median {statistics.median(confidence_values):.2f}",
+            fill=axis_color,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+
+
 def run_stage2(args: argparse.Namespace) -> None:
     scan_dir = args.out_dir / "scans"
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -1489,6 +1755,36 @@ def run_stage7(args: argparse.Namespace) -> None:
             f"wrote {output_path} "
             f"(scan {match.scan_index}, score {match.pose.score:.2f})"
         )
+
+
+def run_stage8(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.smoothing_window <= 0:
+        raise ValueError("--smoothing-window must be greater than 0")
+    if args.bin_count <= 0:
+        raise ValueError("--bin-count must be greater than 0")
+
+    samples = compute_heading_samples(
+        lidar_path=args.lidar,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+        bin_count=args.bin_count,
+        smoothing_window=args.smoothing_window,
+        min_segment_m=args.min_segment_m,
+        max_segment_m=args.max_segment_m,
+        min_range_m=args.min_range_m,
+        max_range_m=args.max_range_m,
+    )
+    output_path = args.out_dir / "06_heading_over_time.png"
+    write_heading_plot(
+        samples=samples,
+        output_path=output_path,
+        stride=args.stride,
+        turn_threshold_deg=args.turn_threshold_deg,
+    )
+    print(f"computed {len(samples)} heading samples")
+    print(f"wrote {output_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1868,6 +2164,79 @@ def build_parser() -> argparse.ArgumentParser:
             help="heading search step in degrees",
         )
         command.set_defaults(func=run_stage7)
+
+    for command_name in ("stage8", "heading-plot"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 8 heading and structure plot",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="scan stride for heading samples",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--bin-count",
+            type=int,
+            default=72,
+            help="orientation histogram bins over 180 degrees",
+        )
+        command.add_argument(
+            "--smoothing-window",
+            type=int,
+            default=31,
+            help="rolling median window in sampled scans",
+        )
+        command.add_argument(
+            "--min-segment-m",
+            type=float,
+            default=0.05,
+            help="minimum adjacent-point segment length",
+        )
+        command.add_argument(
+            "--max-segment-m",
+            type=float,
+            default=1.2,
+            help="maximum adjacent-point segment length",
+        )
+        command.add_argument(
+            "--min-range-m",
+            type=float,
+            default=0.7,
+            help="minimum point range used for structure extraction",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum point range used for structure extraction",
+        )
+        command.add_argument(
+            "--turn-threshold-deg",
+            type=float,
+            default=45.0,
+            help="smoothed angle jump that marks a turn",
+        )
+        command.set_defaults(func=run_stage8)
 
     return parser
 
