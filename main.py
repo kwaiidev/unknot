@@ -1114,6 +1114,8 @@ def write_odometry_preview(
     output_path: Path,
     limit: int,
     stride: int,
+    title: str | None = None,
+    subtitle: str | None = None,
 ) -> None:
     try:
         from PIL import Image, ImageDraw
@@ -1170,10 +1172,14 @@ def write_odometry_preview(
         draw.line([(left, y), (left + plot_width, y)], fill=grid_color)
 
     draw.rectangle((left, top, left + plot_width, top + plot_height), outline=axis_color)
-    draw.text((left, 18), f"Stage 6 odometry preview: first {limit} scans", fill=axis_color)
+    title = title or f"Stage 6 odometry preview: first {limit} scans"
+    subtitle = subtitle or (
+        f"{len(poses)} keyframe poses | stride {stride} | local scan-to-submap search"
+    )
+    draw.text((left, 18), title, fill=axis_color)
     draw.text(
         (left, 40),
-        f"{len(poses)} keyframe poses | stride {stride} | local scan-to-submap search",
+        subtitle,
         fill=axis_color,
     )
 
@@ -1787,6 +1793,49 @@ def run_stage8(args: argparse.Namespace) -> None:
     print(f"wrote {output_path}")
 
 
+def run_stage9(args: argparse.Namespace) -> None:
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0")
+    if args.max_points <= 0:
+        raise ValueError("--max-points must be greater than 0")
+    if args.search_step_m <= 0.0:
+        raise ValueError("--search-step-m must be greater than 0")
+    if args.search_theta_step_deg <= 0.0:
+        raise ValueError("--search-theta-step-deg must be greater than 0")
+
+    limit = args.limit or count_scans(args.lidar)
+    poses = estimate_odometry(
+        lidar_path=args.lidar,
+        limit=limit,
+        stride=args.stride,
+        min_valid_points=args.min_valid_points,
+        max_points=args.max_points,
+        min_range_m=args.min_range_m,
+        max_range_m=args.max_range_m,
+        cell_size_m=args.cell_size_m,
+        inflation_cells=args.inflation_cells,
+        submap_keyframes=args.submap_keyframes,
+        search_xy_m=args.search_xy_m,
+        search_step_m=args.search_step_m,
+        search_theta_deg=args.search_theta_deg,
+        search_theta_step_deg=args.search_theta_step_deg,
+    )
+    output_path = args.out_dir / "07_full_odometry_raw.png"
+    write_odometry_preview(
+        poses=poses,
+        output_path=output_path,
+        limit=limit,
+        stride=args.stride,
+        title="Stage 9 full raw odometry trajectory",
+        subtitle=(
+            f"{len(poses)} keyframe poses from first {limit} scans | "
+            f"stride {args.stride} | no loop closure"
+        ),
+    )
+    print(f"estimated {len(poses)} poses for first {limit} scans")
+    print(f"wrote {output_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="LiDAR trajectory reconstruction diagnostics."
@@ -2237,6 +2286,102 @@ def build_parser() -> argparse.ArgumentParser:
             help="smoothed angle jump that marks a turn",
         )
         command.set_defaults(func=run_stage8)
+
+    for command_name in ("stage9", "full-odom"):
+        command = subparsers.add_parser(
+            command_name,
+            help="generate Stage 9 full raw odometry trajectory",
+        )
+        command.add_argument(
+            "--lidar",
+            type=Path,
+            default=DEFAULT_LIDAR_PATH,
+            help=f"input NDJSON LiDAR file (default: {DEFAULT_LIDAR_PATH})",
+        )
+        command.add_argument(
+            "--out-dir",
+            type=Path,
+            default=DEFAULT_OUTPUT_DIR,
+            help=f"output directory (default: {DEFAULT_OUTPUT_DIR})",
+        )
+        command.add_argument(
+            "--limit",
+            type=int,
+            help="scan prefix limit; defaults to the full dataset",
+        )
+        command.add_argument(
+            "--stride",
+            type=int,
+            default=10,
+            help="keyframe stride in scans",
+        )
+        command.add_argument(
+            "--min-valid-points",
+            type=int,
+            default=100,
+            help="skip scans with fewer valid returns",
+        )
+        command.add_argument(
+            "--max-points",
+            type=int,
+            default=120,
+            help="maximum scan points used by the matcher",
+        )
+        command.add_argument(
+            "--min-range-m",
+            type=float,
+            default=0.7,
+            help="minimum point range used by the matcher",
+        )
+        command.add_argument(
+            "--max-range-m",
+            type=float,
+            default=12.0,
+            help="maximum point range used by the matcher",
+        )
+        command.add_argument(
+            "--cell-size-m",
+            type=float,
+            default=0.25,
+            help="submap occupancy grid cell size in meters",
+        )
+        command.add_argument(
+            "--inflation-cells",
+            type=int,
+            default=1,
+            help="cell inflation radius for scan matching tolerance",
+        )
+        command.add_argument(
+            "--submap-keyframes",
+            type=int,
+            default=8,
+            help="number of recent keyframes in the local submap",
+        )
+        command.add_argument(
+            "--search-xy-m",
+            type=float,
+            default=0.8,
+            help="translation search radius around prediction in meters",
+        )
+        command.add_argument(
+            "--search-step-m",
+            type=float,
+            default=0.4,
+            help="translation search step in meters",
+        )
+        command.add_argument(
+            "--search-theta-deg",
+            type=float,
+            default=8.0,
+            help="heading search radius around prediction in degrees",
+        )
+        command.add_argument(
+            "--search-theta-step-deg",
+            type=float,
+            default=4.0,
+            help="heading search step in degrees",
+        )
+        command.set_defaults(func=run_stage9)
 
     return parser
 
